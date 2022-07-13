@@ -4,6 +4,7 @@ __all__ = ['CausalLMOutputWithCrossAttentions', 'ValueHead', 'GPT2HeadWithValueM
 
 # Cell
 
+from mimetypes import init
 from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Model, GPT2PreTrainedModel
 from transformers import top_k_top_p_filtering
 from transformers.modeling_outputs import ModelOutput
@@ -78,20 +79,47 @@ class ValueHead(nn.Module):
 # Cell
 # TODO: This is the Value Function Transformer (I assume). In the ILQL paper, it says:
 # Our value function transformer has three MLP heads: two independently initialized and trained Q heads and one V head. 
+'''
+It also says:
+
+We run all of our experiments on GPT-2 small transformer architectures,
+    with the supervised learning policy on one transformer
+    and Q and V heads on a separate one. 
+    The target Q network is also on a separate transformer
+
+So I need 3 transformers? What is a supervised learning policy?
+
+'''
+
+class QHead(nn.Module): 
+    def __init__(self, config) -> None:
+        super().__init__()
+        # TODO: Should I detach head ever?
+        self.hidden_dimension = config.n_embd
+        self.linear_1 = nn.Linear(self.hidden_dimension, self.hidden_dimension*2)
+        self.non_linearity = nn.ReLU(),
+        self.linear_2 = nn.Linear(self.hidden_dimension*2, 1),
+        # nn.Linear(self.h_dim*2, self.dataset.tokenizer.num_tokens()), <-- This is how it is on the ILQL Code for a Q Head. But where do I find num_tokens?
+        # TODO: Whether we use num_tokens() or 1 as an output dimension depends on if it is PerToken (1) or PerUtterance (num_tokens())
+    def forward(self, x):
+        x = self.linear_1(x)
+        x = self.non_linearity(x)
+        x = self.linear_2(x)
+        return x
+
 class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
     """The GPT2HeadWithValueModel class implements a GPT2 language model with a secondary, scalar head."""
     def __init__(self, config):
         super().__init__(config)
         config.num_labels = 1
         self.transformer = GPT2Model(config)
-        # TODO: config.n_embd is the embedding dimension I assume. Does this mean that self.lm_head is the layers referred to in ILQL paper?
-        #  Meaning:
-        #     TODO: For ILQL;
-        # "Each head has two layers, with a hidden dimension twice that of the transformer’s embedding dimension"
-        # How would this change this piece of code? Add another lm_head?
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.q1 = QHead(config)
+        self.q2 = QHead(config)
         self.v_head = ValueHead(config)
         # TODO: I should add two "independently initialized and trained Q heads"? Does this mean I make a different class, QHead? Or re-use ValueHead?
+        # TODO: "Our target Q networks are Polyak-averaged with decay factor 0.005 for both the transformer and the Q function head"
+        #   ^ What does this mean?
 
 
         self.init_weights()
@@ -135,9 +163,12 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
         lm_logits = self.lm_head(hidden_states)
         value = self.v_head(hidden_states).squeeze(-1)
 
+        # TODO: I just copied the line above. Most likely incorrect. 
+        q1 = self.q1(hidden_states).squeeze(-1)
+        q2 = self.q1(hidden_states).squeeze(-1)
 
         if not return_dict:
-            outputs = (lm_logits,) + transformer_outputs[1:] + (value,)
+            outputs = (lm_logits,) + transformer_outputs[1:] + (value,) + (q1,) + (q2,)
             return outputs
 
         # What is this ? How would this change since I added the 2 Q Heads from the paper?

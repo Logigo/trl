@@ -25,6 +25,29 @@ from .core import (logprobs_from_logits,
                       WANDB_PADDING)
 
 # Cell
+# 1. ILQLTrainer gets initialized with its parameters, a tokenizer, and a model (M).
+# 2. The tokenizer is given a query (sentence) to encode into a Tensor Q_T.
+# 3. The model M responds to the encoded query Q_T, and the tokenizer decodes the response R_T.
+# 4. There is a reward r. Somehow. 
+# 5. The ILQLTrainer calls Step on the query and response tensors (Q_T and R_T) and reward r.
+# 6. Step(Q_T, R_T, r) -> Stats:
+#   a. Runs batched_forward_pass(Q_T, R_T) to get logprobs, ref_logprobs, and values
+#       a.i. For each iteration of size BS/FBS, runs the model M on input of [query, response].
+#           to return logits, and values. Runs [query, response] through reference model M_r to return
+#              reference logits. TODO: Should this return logits, values, and q, for ILQL?
+#       a.ii. Logits and reference logits are turned into logprobs and ref_logprobs. Returns
+#           lists of logprobs, ref_logprobs, and values
+#   b. Runs compute_rewards(scores=r, logprobs, ref_logprobs) to get rewards, non_score_rewards
+#       b.i. for each score (aka r), logprob, ref_logprob, computes KL Divergence as logprob - ref_logprob.
+#           Math wise, subtraction of logs is log of their division. It then scales the KL Divergence,
+#           and scores it as a non-score-reward and an identical value + score (r) as a reward.
+#       b.ii. It then returns the rewards and non_score_rewards            
+#   c. For each epoch: --> For each shuffled batch:
+#       c.i. Calls train_minibatch(logprob[idx], values[idx], rewards[idx], queries[idx], responses[idx], [query, response])
+#           c.i.1. For the logprob, value, reward, query, response, and original model input ([query, response] pair):
+#           c.i.2. Calculates loss and runs propagates loss backwards, optimizer takes a step.
+#           c.i.3. Loss Calculation(old_logprobs, values, rewards, query(unused), response, model_input)
+# 
 
 class ILQLTrainer:
     """
@@ -32,12 +55,17 @@ class ILQLTrainer:
     """
 
     default_params = {
-        "lr": 1.41e-5,
+        "lr": 1e-4, # From the paper, A.3
         "batch_size": 256,
         "forward_batch_size": 16,
+        "visual_dialogue_batch_size": 64,
+        "reddit_batch_size": 32,
         "ppo_epochs": 4,
-        "gamma":1,
-        "alpha":0.1
+        "gamma": 0.99, # From the paper, A.3
+        "alpha": 0.1,
+        "tau": 0.7,
+        "polyak_decay": 0.005
+
     }
 
     def __init__(self, model, tokenizer, **ilql_params):
@@ -65,8 +93,6 @@ class ILQLTrainer:
 
         self.optimizer = Adam(model.parameters(), lr=self.ppo_params['lr'])
 
-
-
     def step(self, queries, responses, scores):
         """
         Run a ILQL optimisation step.
@@ -89,7 +115,7 @@ class ILQLTrainer:
         response_lengths = [len(r) for r in responses]
 
         t = time.time()
-        logprobs, ref_logprobs, values = self.batched_forward_pass(queries, responses)
+        logprobs, ref_logprobs, values, q = self.batched_forward_pass(queries, responses)
         timing['time/ppo/forward_pass'] = time.time()-t
 
         t = time.time()
@@ -137,23 +163,29 @@ class ILQLTrainer:
         all_logprobs = []
         all_ref_logprobs = []
         all_values = []
+        all_q = []
 
         for i in range(int(bs/fbs)):
             query_batch = queries[i*fbs:(i+1)*fbs]
             response_batch = responses[i*fbs:(i+1)*fbs]
             input_ids = self.data_collator([torch.cat([q, r]) for q, r in zip(query_batch, response_batch)])["input_ids"]
             with torch.no_grad():
-                logits, _, v = self.model(input_ids)
+                # TODO: q1 and q2 should have min taken
+                logits, _, v, q1, q2 = self.model(input_ids)
+                # TODO: Is this the right function?
+                q = torch.minimum(q1, q2)
                 ref_logits, _, _ = self.ref_model(input_ids)
             logprobs = logprobs_from_logits(logits[:,:-1,:], input_ids[:,1:])
             ref_logprobs = logprobs_from_logits(ref_logits[:,:-1,:], input_ids[:,1:])
             for j in range(fbs):
                 start = len(query_batch[j])-1
                 end = len(query_batch[j]) + len(response_batch[j])-1
+                # TODO: Is this right? Who knows!
+                all_q.append(q[j, start-1:end-1])
                 all_values.append(v[j, start-1:end-1])
                 all_logprobs.append(logprobs[j, start:end])
                 all_ref_logprobs.append(ref_logprobs[j, start:end])
-        return all_logprobs, all_ref_logprobs, all_values
+        return all_logprobs, all_ref_logprobs, all_values, all_q
 
     def train_minibatch(self, logprobs, values, rewards, query, response, model_input):
         """Train one PPO minibatch"""
@@ -176,9 +208,17 @@ class ILQLTrainer:
             rewards.append(reward)
         return rewards, non_score_rewards
 
+    def L_QV(self, old_logprobs, values, rewards, query, response, model_input):
+        return None, {}
+
+    def L_CQL(self, old_logprobs, values, rewards, query, response, model_input):
+        return None, {}
 
     def ilql_loss(self, old_logprobs, values, rewards, query, response, model_input):
-        pass
+        qv_loss, qv_stats = self.L_QV(old_logprobs, values, rewards, query, response, model_input)
+        cql_loss, cql_stats = self.L_CQL(old_logprobs, values, rewards, query, response, model_input)
+        stats = {qv_stats, cql_stats} # TODO: What is this?
+        return qv_loss + (self.ilql_params['alpha'] * cql_loss), flatten_dict(stats)
 
 
     def loss(self, old_logprobs, values, rewards, query, response, model_input):
@@ -262,3 +302,4 @@ class ILQLTrainer:
             stats[f'ppo/{k}'] = torch.mean(v, axis=0)
         stats['ppo/val/var_explained'] = 1 - stats['ppo/val/error'] / stats['ppo/returns/var']
         return stats
+
