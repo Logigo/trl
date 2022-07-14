@@ -191,14 +191,14 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
 
         # What is this ? How would this change since I added the 2 Q Heads from the paper?
         return CausalLMOutputWithCrossAttentions(
-            loss=loss,
-            logits=lm_logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
+            loss=loss, # Who is that?
+            logits=lm_logits, # What is this?
+            past_key_values=transformer_outputs.past_key_values, # What!
+            hidden_states=transformer_outputs.hidden_states, # WHO?!
+            attentions=transformer_outputs.attentions, # Why!
+            cross_attentions=transformer_outputs.cross_attentions, # I don't understand.
             value=value,
-            qs=(q1, q2)
+            qs=(q1, q2) # Do tuples belong here? Do *I* belong here?
             target_qs=(target_q1, target_q2)
         )
 
