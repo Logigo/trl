@@ -121,11 +121,11 @@ class GPT2HeadWithValueModel(GPT2PreTrainedModel):
         lm_logits = self.lm_head(hidden_states)
         value = self.v_head(hidden_states).squeeze(-1)
 
-        # TODO: How does this get unpacked into logits, _, values? 
+        # TODO: this gets unpacked into logits, _, values? 
         if not return_dict:
             outputs = (lm_logits,) + transformer_outputs[1:] + (value,)
             return outputs
-            
+
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,

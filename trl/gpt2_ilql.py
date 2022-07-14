@@ -25,6 +25,8 @@ class CausalLMOutputWithCrossAttentions(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
     value: Optional[torch.FloatTensor] = None
+    qs: Optional[Tuple[torch.FloatTensor]] = None
+    target_qs: Optional[Tuple[torch.FloatTensor]] = None
 
 # Cell
 
@@ -35,6 +37,7 @@ class ValueHead(nn.Module):
     "Each head has two layers, with a hidden dimension twice that of the transformer’s embedding dimension"
     How would this change this piece of code? I don't see any layers, or how to find the transformer's embedding dimension. 
     """
+    # TODO: Change this to have 2 Linear Layers and follow ILQL paper instructions
     def __init__(self, config):
         super().__init__()
         self.detach_head = False
@@ -116,6 +119,10 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.q1 = QHead(config)
         self.q2 = QHead(config)
+
+        self.target_q1 = QHead(config)
+        self.target_q2 = QHead(config)
+
         self.v_head = ValueHead(config)
         # TODO: I should add two "independently initialized and trained Q heads"? Does this mean I make a different class, QHead? Or re-use ValueHead?
         # TODO: "Our target Q networks are Polyak-averaged with decay factor 0.005 for both the transformer and the Q function head"
@@ -159,16 +166,27 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
         )
 
         hidden_states = transformer_outputs[0]
-
+        state_hidden_states = torch.clone(hidden_states)
+        action_hidden_states = torch.clone(hidden_states)
+        action_target_hidden_states = torch.clone(hidden_states)
         lm_logits = self.lm_head(hidden_states)
-        value = self.v_head(hidden_states).squeeze(-1)
+
+        value = self.v_head(state_hidden_states).squeeze(-1)
 
         # TODO: I just copied the line above. Most likely incorrect. 
-        q1 = self.q1(hidden_states).squeeze(-1)
-        q2 = self.q1(hidden_states).squeeze(-1)
+        # Polyak averaged Q Heads
+        # TODO: The Q should take action_hidden states, but the value should take the state hidden state. Why? Look at 287-291:
+        # https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L287-L291
+        q1 = self.q1(action_hidden_states).squeeze(-1)
+        q2 = self.q2(action_hidden_states).squeeze(-1)
+        # TODO: These should have no_grad() according to 
+        #  https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L294
+        with torch.no_grad():
+            target_q1 = self.target_q1(action_target_hidden_states).squeeze(-1)
+            target_q2 = self.target_q2(action_target_hidden_states).squeeze(-1)
 
         if not return_dict:
-            outputs = (lm_logits,) + transformer_outputs[1:] + (value,) + (q1,) + (q2,)
+            outputs = (lm_logits,) + transformer_outputs[1:] + (value,) + (q1,) + (q2,) + (target_q1,) + (target_q2,)
             return outputs
 
         # What is this ? How would this change since I added the 2 Q Heads from the paper?
@@ -180,8 +198,9 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
             value=value,
+            qs=(q1, q2)
+            target_qs=(target_q1, target_q2)
         )
-        return outputs
 
 # Cell
 
