@@ -36,6 +36,7 @@ class ValueHead(nn.Module):
     TODO: For ILQL;
     "Each head has two layers, with a hidden dimension twice that of the transformer’s embedding dimension"
     How would this change this piece of code? I don't see any layers, or how to find the transformer's embedding dimension. 
+    ^ I think I figured this part out. 
     """
     # TODO: Change this to have 2 Linear Layers and follow ILQL paper instructions
     def __init__(self, config):

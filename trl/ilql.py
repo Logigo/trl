@@ -171,7 +171,7 @@ class ILQLTrainer:
             input_ids = self.data_collator([torch.cat([q, r]) for q, r in zip(query_batch, response_batch)])["input_ids"]
             with torch.no_grad():
                 # TODO: q1 and q2 should have min taken
-                logits, _, v, q1, q2 = self.model(input_ids)
+                logits, _, v, q1, q2, target_q1, target_q2 = self.model(input_ids)
                 # TODO: Is this the right function?
                 q = torch.minimum(q1, q2)
                 ref_logits, _, _ = self.ref_model(input_ids)
