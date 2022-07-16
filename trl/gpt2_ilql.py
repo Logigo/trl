@@ -199,7 +199,7 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
             attentions=transformer_outputs.attentions, # Why!
             cross_attentions=transformer_outputs.cross_attentions, # I don't understand.
             value=value,
-            qs=(q1, q2) # Do tuples belong here? Do *I* belong here?
+            qs=(q1, q2), # Do tuples belong here? Do *I* belong here?
             target_qs=(target_q1, target_q2)
         )
 

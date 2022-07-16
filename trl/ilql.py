@@ -60,7 +60,7 @@ class ILQLTrainer:
         "forward_batch_size": 16,
         "visual_dialogue_batch_size": 64,
         "reddit_batch_size": 32,
-        "ppo_epochs": 4,
+        "ilql_epochs": 4,
         "gamma": 0.99, # From the paper, A.3
         "alpha": 0.1,
         "tau": 0.7,
@@ -70,7 +70,7 @@ class ILQLTrainer:
 
     def __init__(self, model, tokenizer, **ilql_params):
         """
-        Initialize PPOTrainer.
+        Initialize ILQLTrainer.
 
         Args:
             model (torch.model): Hugging Face transformer GPT2 model with value head
@@ -79,7 +79,7 @@ class ILQLTrainer:
                 'lr' (float): Adam learning rate, default: 1.41e-5
                 'batch_size' (int): Number of samples per optimisation step, default: 256
                 'forward_batch_size' (int): Number of samples forward passed through model at a time, default: 16
-                'ppo_epochs' (int): Number of optimisation epochs per batch of samples, default: 4
+                'ilql_epochs' (int): Number of optimisation epochs per batch of samples, default: 4
                 'gamma' (float)): Gamma parameter for advantage calculation, default: 1.
                 'alpha' (float): Alpha parameter for CQL loss term, default: 0.1
 
@@ -105,8 +105,8 @@ class ILQLTrainer:
         returns:
             train_stats (dict): a summary of the training statistics
         """
-
-        bs = self.ppo_params['batch_size']
+        # TODO: Where does the GPT2HeadWithQValueModel tie into this?
+        bs = self.ilql_params['batch_size']
         assert bs == len(queries), f"Batch size ({bs}) does not match number of examples ({len(queries)})"
 
         timing = dict()
@@ -115,21 +115,34 @@ class ILQLTrainer:
         response_lengths = [len(r) for r in responses]
 
         t = time.time()
-        logprobs, ref_logprobs, values, q = self.batched_forward_pass(queries, responses)
-        timing['time/ppo/forward_pass'] = time.time()-t
+        # TODO:
+        logprobs, ref_logprobs, v, q, target_q = self.batched_forward_pass(queries, responses)
+        timing['time/ilql/forward_pass'] = time.time()-t
 
         t = time.time()
-        rewards, non_score_reward = self.compute_rewards(scores, logprobs, ref_logprobs)
-        timing['time/ppo/compute_rewards'] = time.time()-t
+        # TODO: Should this even exist in ILQL? Don't we get rewards from BERT? What does this do?
+        # rewards, non_score_reward = self.compute_rewards(scores, logprobs, ref_logprobs)
+        # TODO: Since ILQL Rewards are just +ve word sentiments (without any KL divergence term), it is kept
+        #  as is.
+        rewards = scores
+        timing['time/ilql/compute_rewards'] = time.time()-t
 
         t = time.time()
         all_stats = []
         idxs = list(range(bs))
-        for _ in range(self.ppo_params['ppo_epochs']):
+        for _ in range(self.ppo_params['ilql_epochs']):
             random.shuffle(idxs)
             for i in range(bs):
                 idx = idxs[i]
-                train_stats = self.train_minibatch(logprobs[idx].unsqueeze(0), values[idx].unsqueeze(0),
+                # TODO: Change function arguments. 
+                # Refer to https://github.dev/rail-berkeley/rlkit/blob/master/rlkit/torch/sac/iql_trainer.py
+                # I think this needs: 
+                #  q_pred (detached): min(model.tq1(s, a), model.tq2(s, a)),
+                #  q1_pred, q2_pred <-- self.q1(s, a)
+                #  v: model.v(s),
+                #  target_v: model.v(next_s) (detached) <-- TODO
+
+                train_stats = self.train_ilql_minibatch(logprobs[idx].unsqueeze(0), v[idx].unsqueeze(0),
                                                    rewards[idx].unsqueeze(0), queries[idx].unsqueeze(0),
                                                    responses[idx].unsqueeze(0),
                                                    torch.cat([queries[idx],responses[idx]]).unsqueeze(0))
@@ -144,26 +157,28 @@ class ILQLTrainer:
         train_stats['policy/advantages'] = torch.nan_to_num(train_stats['policy/advantages'], WANDB_PADDING)
         train_stats['policy/ratio'] = torch.flatten(train_stats['policy/ratio']).unsqueeze(0)
 
+        # TODO: Update record_step_stats with the right values
         stats = self.record_step_stats(scores=scores, logprobs=logprobs, ref_logprobs=ref_logprobs,
                                        non_score_reward=non_score_reward, train_stats=train_stats,
                                        kl_coef=self.kl_ctl.value)
         stats = stats_to_np(stats)
-        timing['time/ppo/calc_stats'] = time.time()-t
+        timing['time/ilql/calc_stats'] = time.time()-t
 
         self.kl_ctl.update(stats['objective/kl'], self.ppo_params['batch_size'])
 
-        timing['time/ppo/total'] = time.time()-t0
+        timing['time/ilql/total'] = time.time()-t0
         stats.update(timing)
         return stats
 
     def batched_forward_pass(self, queries, responses):
         """Calculate model outputs in multiple batches."""
-        bs = self.ppo_params['batch_size']
-        fbs = self.ppo_params['forward_batch_size']
+        bs = self.ilql_params['batch_size']
+        fbs = self.ilql_params['forward_batch_size']
         all_logprobs = []
         all_ref_logprobs = []
         all_values = []
         all_q = []
+        all_target_q = []
 
         for i in range(int(bs/fbs)):
             query_batch = queries[i*fbs:(i+1)*fbs]
@@ -174,7 +189,9 @@ class ILQLTrainer:
                 logits, _, v, q1, q2, target_q1, target_q2 = self.model(input_ids)
                 # TODO: Is this the right function?
                 q = torch.minimum(q1, q2)
+                target_q = torch.minimum(target_q1, target_q2)
                 ref_logits, _, _ = self.ref_model(input_ids)
+            # TODO: What is happening with the indices here?
             logprobs = logprobs_from_logits(logits[:,:-1,:], input_ids[:,1:])
             ref_logprobs = logprobs_from_logits(ref_logits[:,:-1,:], input_ids[:,1:])
             for j in range(fbs):
@@ -182,10 +199,11 @@ class ILQLTrainer:
                 end = len(query_batch[j]) + len(response_batch[j])-1
                 # TODO: Is this right? Who knows!
                 all_q.append(q[j, start-1:end-1])
+                all_target_q.append(target_q[j, start-1:end-1])
                 all_values.append(v[j, start-1:end-1])
                 all_logprobs.append(logprobs[j, start:end])
                 all_ref_logprobs.append(ref_logprobs[j, start:end])
-        return all_logprobs, all_ref_logprobs, all_values, all_q
+        return all_logprobs, all_ref_logprobs, all_values, all_q, all_target_q
 
     def train_minibatch(self, logprobs, values, rewards, query, response, model_input):
         """Train one PPO minibatch"""
@@ -195,6 +213,15 @@ class ILQLTrainer:
         loss.backward()
         self.optimizer.step()
         return train_stats
+
+    # TODO: Arguments need to be changed. 
+    def train_ilql_minibatch(self, logprobs, values, rewards, query, response, model_input):
+        loss, train_stats = self.ilql_loss()
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return train_stats
+
 
     def compute_rewards(self, scores, logprobs, ref_logprobs):
         """Compute per token rewards from scores and KL-penalty."""
@@ -209,6 +236,17 @@ class ILQLTrainer:
         return rewards, non_score_rewards
 
     def L_QV(self, old_logprobs, values, rewards, query, response, model_input):
+        # R(s, a) + V(s_i+1) - Q(s, a) <-- squared
+        # +
+        # Expectile loss(Q_hat(s, a) - V(s) )
+        L_Q = 0.
+        L_V = 0.
+        gen_len = response.shape[1]
+        for i, state, action in enumerate(zip(query, response)):
+            reward = rewards[i]
+            value = values[i]
+            next_value = values[i + 1] if i < gen_len else 0.0
+            
         return None, {}
 
     def L_CQL(self, old_logprobs, values, rewards, query, response, model_input):
