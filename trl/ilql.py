@@ -117,7 +117,7 @@ class ILQLTrainer:
 
         t = time.time()
         # TODO: add next_v
-        logprobs, ref_logprobs, v, next_v, q, target_q = self.batched_forward_pass(queries, responses)
+        logprobs, ref_logprobs, v, q, target_q = self.batched_forward_pass(queries, responses)
         timing['time/ilql/forward_pass'] = time.time()-t
 
         t = time.time()
@@ -142,6 +142,7 @@ class ILQLTrainer:
                 #  q1_pred, q2_pred <-- self.q1(s, a)
                 #  v: model.v(s),
                 #  target_v: model.v(next_s) (detached) <-- TODO
+                next_v = v[idx + 1] if idx < bs else 0.
                 train_stats = self.train_minibatch(logprobs[idx].unsqueeze(0), v[idx].unsqueeze(0), next_v,
                                                     q[idx].unsqueeze(0), target_q[idx].unsqueeze[0], rewards[idx].unsqueeze(0),
                                                     queries[idx].unsqueeze(0), responses[idx].unsqueeze(0), 
@@ -176,6 +177,8 @@ class ILQLTrainer:
         fbs = self.ilql_params['forward_batch_size']
         all_logprobs = []
         all_ref_logprobs = []
+        all_states = [] # NOTE : TODO - If this is passed into the loss fn, where does V(s') get computed?
+        # In the model, or in the loss fn?
         all_values = []
         all_q = []
         all_target_q = []
