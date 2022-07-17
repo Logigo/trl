@@ -82,6 +82,7 @@ class ILQLTrainer:
                 'ilql_epochs' (int): Number of optimisation epochs per batch of samples, default: 4
                 'gamma' (float)): Gamma parameter for advantage calculation, default: 1.
                 'alpha' (float): Alpha parameter for CQL loss term, default: 0.1
+                TODO: Add lambda_Q, lambda_V
 
         """
         self.ilql_params = self.default_params
@@ -115,8 +116,8 @@ class ILQLTrainer:
         response_lengths = [len(r) for r in responses]
 
         t = time.time()
-        # TODO:
-        logprobs, ref_logprobs, v, q, target_q = self.batched_forward_pass(queries, responses)
+        # TODO: add next_v
+        logprobs, ref_logprobs, v, next_v, q, target_q = self.batched_forward_pass(queries, responses)
         timing['time/ilql/forward_pass'] = time.time()-t
 
         t = time.time()
@@ -130,7 +131,7 @@ class ILQLTrainer:
         t = time.time()
         all_stats = []
         idxs = list(range(bs))
-        for _ in range(self.ppo_params['ilql_epochs']):
+        for _ in range(self.ilql_params['ilql_epochs']):
             random.shuffle(idxs)
             for i in range(bs):
                 idx = idxs[i]
@@ -141,11 +142,10 @@ class ILQLTrainer:
                 #  q1_pred, q2_pred <-- self.q1(s, a)
                 #  v: model.v(s),
                 #  target_v: model.v(next_s) (detached) <-- TODO
-
-                train_stats = self.train_ilql_minibatch(logprobs[idx].unsqueeze(0), v[idx].unsqueeze(0),
-                                                   rewards[idx].unsqueeze(0), queries[idx].unsqueeze(0),
-                                                   responses[idx].unsqueeze(0),
-                                                   torch.cat([queries[idx],responses[idx]]).unsqueeze(0))
+                train_stats = self.train_minibatch(logprobs[idx].unsqueeze(0), v[idx].unsqueeze(0), next_v,
+                                                    q[idx].unsqueeze(0), target_q[idx].unsqueeze[0], rewards[idx].unsqueeze(0),
+                                                    queries[idx].unsqueeze(0), responses[idx].unsqueeze(0), 
+                                                    torch.cat([queries[idx],responses[idx]]).unsqueeze(0))
                 all_stats.append(train_stats)
         timing['time/ppo/optimize_step'] = time.time()-t
 
@@ -205,59 +205,54 @@ class ILQLTrainer:
                 all_ref_logprobs.append(ref_logprobs[j, start:end])
         return all_logprobs, all_ref_logprobs, all_values, all_q, all_target_q
 
-    def train_minibatch(self, logprobs, values, rewards, query, response, model_input):
-        """Train one PPO minibatch"""
-        loss_p, loss_v, train_stats  = self.loss(logprobs, values, rewards, query, response, model_input)
-        loss = loss_p + loss_v
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        return train_stats
 
     # TODO: Arguments need to be changed. 
-    def train_ilql_minibatch(self, logprobs, values, rewards, query, response, model_input):
-        loss, train_stats = self.ilql_loss()
+    def train_minibatch(self, logprob, value, next_value, q, target_q, reward, query, response, model_input):
+        loss, train_stats = self.ilql_loss(logprob, value, next_value, q, target_q, reward, query, response, model_input)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
         return train_stats
 
-
-    def compute_rewards(self, scores, logprobs, ref_logprobs):
-        """Compute per token rewards from scores and KL-penalty."""
-        rewards, non_score_rewards = [], []
-        for score, logprob, ref_logprob in zip(scores, logprobs, ref_logprobs):
-            kl = logprob - ref_logprob
-            non_score_reward = -self.kl_ctl.value * kl
-            non_score_rewards.append(non_score_reward)
-            reward = non_score_reward.clone()
-            reward[-1] += score
-            rewards.append(reward)
-        return rewards, non_score_rewards
-
-    def L_QV(self, old_logprobs, values, rewards, query, response, model_input):
+    def L_QV(self, value, next_value, q, target_q, reward):
         # R(s, a) + V(s_i+1) - Q(s, a) <-- squared
         # +
         # Expectile loss(Q_hat(s, a) - V(s) )
-        L_Q = 0.
-        L_V = 0.
-        gen_len = response.shape[1]
-        for i, state, action in enumerate(zip(query, response)):
-            reward = rewards[i]
-            value = values[i]
-            next_value = values[i + 1] if i < gen_len else 0.0
-            
-        return None, {}
+        gamma = self.ilql_params['gamma']
+        L_Q = (reward + (gamma * next_value) - q) ** 2
+        # Expectile Regression: - I wrote this to be as readable as possible.
+        u = (value - target_q) # Q_hat - V, but flipped
+        fancy_one_symbol = 1. if u > 0 # Usually, this is 1 if u < 0, but we flipped it cause we are minimizing and not maximizing, therefore u is a negative number
+        tau = self.ilql_params['tau']
+        expectile = torch.abs(tau - fancy_one_symbol) * (u ** 2)
+        L_V = expectile # In the IQL implementation, it is averaged with .mean(), but I think that's cause the loss
+        # is applied on the whole batch at the same time (like, implementation wise), whereas the loss fn here takes 1 entry at a time
+        return L_Q + L_V, {}
 
     def L_CQL(self, old_logprobs, values, rewards, query, response, model_input):
+        """
+        if self.double_q:
+            q1, q2 = qs
+            b, t, d = q1.shape
+            return 
+                (
+                 (F.cross_entropy(q1.reshape(-1, d) / self.cql_temp, action_tokens.reshape(-1), reduction='none').reshape(b, t)
+                 * (1 - terminals[:, :-1])) 
+                 +
+                 (F.cross_entropy(q2.reshape(-1, d) / self.cql_temp, action_tokens.reshape(-1), reduction='none').reshape(b, t)
+                 * (1 - terminals[:, :-1]))
+                 )
+                 .sum() / max(n.item(), 1.0)
+        I am not quite sure what the lines above me mean (https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L366-L369)
+        But I am working on it
+        """
         return None, {}
 
-    def ilql_loss(self, old_logprobs, values, rewards, query, response, model_input):
-        qv_loss, qv_stats = self.L_QV(old_logprobs, values, rewards, query, response, model_input)
-        cql_loss, cql_stats = self.L_CQL(old_logprobs, values, rewards, query, response, model_input)
+    def ilql_loss(self, old_logprob, value, next_value, q, target_q, rewards, query, response, model_input):
+        qv_loss, qv_stats = self.L_QV(value, next_value, q, target_q, rewards)
+        cql_loss, cql_stats = self.L_CQL(old_logprob, value, rewards, query, response, model_input)
         stats = {qv_stats, cql_stats} # TODO: What is this?
         return qv_loss + (self.ilql_params['alpha'] * cql_loss), flatten_dict(stats)
-
 
     def loss(self, old_logprobs, values, rewards, query, response, model_input):
         """Calculate policy and value losses."""

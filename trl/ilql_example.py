@@ -17,7 +17,7 @@ ilql_config = {'batch_size': 1, 'forward_batch_size': 1}
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 pipe_device = 0 if torch.cuda.is_available() else -1
 
-wandb.init(name='run-1', project='ilql-gpt2-test', config=ilql_config, )
+wandb.init(name='run-2', project='ilql-gpt2-test', config=ilql_config, )
 
 # load imdb with datasets
 ds = load_dataset('imdb', split='train')
@@ -31,7 +31,7 @@ sent_kwargs = {
     "batch_size": ilql_config["forward_batch_size"]
 }
 
-sentiment_pipe = pipeline("sentiment-analysis","samibg/distilbert-imdb", device=pipe_device)
+sentiment_pipe = pipeline("sentiment-analysis","lvwerra/distilbert-imdb", device=pipe_device)
 # get models
 
 # TODO: Rename and fix models
