@@ -3,7 +3,6 @@
 __all__ = ['CausalLMOutputWithCrossAttentions', 'ValueHead', 'GPT2HeadWithValueModel', 'respond_to_batch']
 
 # Cell
-
 from mimetypes import init
 from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Model, GPT2PreTrainedModel
 from transformers import top_k_top_p_filtering
@@ -101,8 +100,8 @@ class QHead(nn.Module):
         # TODO: Should I detach head ever?
         self.hidden_dimension = config.n_embd
         self.linear_1 = nn.Linear(self.hidden_dimension, self.hidden_dimension*2)
-        self.non_linearity = nn.ReLU(),
-        self.linear_2 = nn.Linear(self.hidden_dimension*2, 1),
+        self.non_linearity = nn.ReLU()
+        self.linear_2 = nn.Linear(self.hidden_dimension*2, 1)
         # nn.Linear(self.h_dim*2, self.dataset.tokenizer.num_tokens()), <-- This is how it is on the ILQL Code for a Q Head. But where do I find num_tokens?
         # TODO: Whether we use num_tokens() or 1 as an output dimension depends on if it is PerToken (1) or PerUtterance (num_tokens())
     def forward(self, x):

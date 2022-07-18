@@ -92,7 +92,7 @@ class ILQLTrainer:
         self.tokenizer = tokenizer
         self.data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
-        self.optimizer = Adam(model.parameters(), lr=self.ppo_params['lr'])
+        self.optimizer = Adam(model.parameters(), lr=self.ilql_params['lr'])
 
     def step(self, queries, responses, scores):
         """
@@ -116,8 +116,8 @@ class ILQLTrainer:
         response_lengths = [len(r) for r in responses]
 
         t = time.time()
-        # TODO: add next_v
-        logprobs, ref_logprobs, v, q, target_q = self.batched_forward_pass(queries, responses)
+        # Named it _q not q so i can use pdb lol
+        logprobs, v, _q, target_q = self.batched_forward_pass(queries, responses)
         timing['time/ilql/forward_pass'] = time.time()-t
 
         t = time.time()
@@ -142,13 +142,15 @@ class ILQLTrainer:
                 #  q1_pred, q2_pred <-- self.q1(s, a)
                 #  v: model.v(s),
                 #  target_v: model.v(next_s) (detached) <-- TODO
-                next_v = v[idx + 1] if idx < bs else 0.
+                print(f'Index:{idx} - BS: {bs}')
+                next_v = v[idx + 1] if (idx + 1) < bs else 0.
+                breakpoint()
                 train_stats = self.train_minibatch(logprobs[idx].unsqueeze(0), v[idx].unsqueeze(0), next_v,
-                                                    q[idx].unsqueeze(0), target_q[idx].unsqueeze[0], rewards[idx].unsqueeze(0),
+                                                    _q[idx].unsqueeze(0), target_q[idx].unsqueeze(0), rewards[idx].unsqueeze(0),
                                                     queries[idx].unsqueeze(0), responses[idx].unsqueeze(0), 
                                                     torch.cat([queries[idx],responses[idx]]).unsqueeze(0))
                 all_stats.append(train_stats)
-        timing['time/ppo/optimize_step'] = time.time()-t
+        timing['time/ilql/optimize_step'] = time.time()-t
 
         t = time.time()
         train_stats = stack_dicts(all_stats)
@@ -159,14 +161,9 @@ class ILQLTrainer:
         train_stats['policy/ratio'] = torch.flatten(train_stats['policy/ratio']).unsqueeze(0)
 
         # TODO: Update record_step_stats with the right values
-        stats = self.record_step_stats(scores=scores, logprobs=logprobs, ref_logprobs=ref_logprobs,
-                                       non_score_reward=non_score_reward, train_stats=train_stats,
-                                       kl_coef=self.kl_ctl.value)
+        stats = self.record_step_stats(scores=scores, logprobs=logprobs, train_stats=train_stats)
         stats = stats_to_np(stats)
         timing['time/ilql/calc_stats'] = time.time()-t
-
-        self.kl_ctl.update(stats['objective/kl'], self.ppo_params['batch_size'])
-
         timing['time/ilql/total'] = time.time()-t0
         stats.update(timing)
         return stats
@@ -176,9 +173,8 @@ class ILQLTrainer:
         bs = self.ilql_params['batch_size']
         fbs = self.ilql_params['forward_batch_size']
         all_logprobs = []
-        all_ref_logprobs = []
         all_states = [] # NOTE : TODO - If this is passed into the loss fn, where does V(s') get computed?
-        # In the model, or in the loss fn?
+        # In the model, or in the loss fn? Answer - gets passed to train minibatch from line below
         all_values = []
         all_q = []
         all_target_q = []
@@ -193,10 +189,10 @@ class ILQLTrainer:
                 # TODO: Is this the right function?
                 q = torch.minimum(q1, q2)
                 target_q = torch.minimum(target_q1, target_q2)
-                ref_logits, _, _ = self.ref_model(input_ids)
+                # ref_logits, _, _ = self.ref_model(input_ids)
             # TODO: What is happening with the indices here?
             logprobs = logprobs_from_logits(logits[:,:-1,:], input_ids[:,1:])
-            ref_logprobs = logprobs_from_logits(ref_logits[:,:-1,:], input_ids[:,1:])
+            # ref_logprobs = logprobs_from_logits(ref_logits[:,:-1,:], input_ids[:,1:])
             for j in range(fbs):
                 start = len(query_batch[j])-1
                 end = len(query_batch[j]) + len(response_batch[j])-1
@@ -205,8 +201,7 @@ class ILQLTrainer:
                 all_target_q.append(target_q[j, start-1:end-1])
                 all_values.append(v[j, start-1:end-1])
                 all_logprobs.append(logprobs[j, start:end])
-                all_ref_logprobs.append(ref_logprobs[j, start:end])
-        return all_logprobs, all_ref_logprobs, all_values, all_q, all_target_q
+        return all_logprobs, all_values, all_q, all_target_q
 
 
     # TODO: Arguments need to be changed. 
@@ -225,14 +220,14 @@ class ILQLTrainer:
         L_Q = (reward + (gamma * next_value) - q) ** 2
         # Expectile Regression: - I wrote this to be as readable as possible.
         u = (value - target_q) # Q_hat - V, but flipped
-        fancy_one_symbol = 1. if u > 0 # Usually, this is 1 if u < 0, but we flipped it cause we are minimizing and not maximizing, therefore u is a negative number
+        fancy_one_symbol = 1. if u > 0 else 0. # Usually, this is 1 if u < 0, but we flipped it cause we are minimizing and not maximizing, therefore u is a negative number
         tau = self.ilql_params['tau']
         expectile = torch.abs(tau - fancy_one_symbol) * (u ** 2)
         L_V = expectile # In the IQL implementation, it is averaged with .mean(), but I think that's cause the loss
         # is applied on the whole batch at the same time (like, implementation wise), whereas the loss fn here takes 1 entry at a time
         return L_Q + L_V, {}
 
-    def L_CQL(self, old_logprobs, values, rewards, query, response, model_input):
+    def L_CQL(self, values, rewards, query, response, model_input):
         """
         if self.double_q:
             q1, q2 = qs
@@ -249,75 +244,17 @@ class ILQLTrainer:
         I am not quite sure what the lines above me mean (https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L366-L369)
         But I am working on it
         """
+
         return None, {}
 
     def ilql_loss(self, old_logprob, value, next_value, q, target_q, rewards, query, response, model_input):
+        breakpoint()
         qv_loss, qv_stats = self.L_QV(value, next_value, q, target_q, rewards)
-        cql_loss, cql_stats = self.L_CQL(old_logprob, value, rewards, query, response, model_input)
+        cql_loss, cql_stats = self.L_CQL(value, rewards, query, response, model_input)
         stats = {qv_stats, cql_stats} # TODO: What is this?
         return qv_loss + (self.ilql_params['alpha'] * cql_loss), flatten_dict(stats)
 
-    def loss(self, old_logprobs, values, rewards, query, response, model_input):
-        """Calculate policy and value losses."""
-        lastgaelam = 0
-        advantages_reversed = []
-        gen_len = response.shape[1]
-
-        for t in reversed(range(gen_len)):
-            nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
-            delta = rewards[:, t] + self.ppo_params['gamma'] * nextvalues - values[:, t]
-            lastgaelam = delta + self.ppo_params['gamma'] * self.ppo_params['lam'] * lastgaelam
-            advantages_reversed.append(lastgaelam)
-        advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
-
-        returns = advantages + values
-        advantages = whiten(advantages)
-        advantages = advantages.detach()
-
-        logits, _, vpred = self.model(model_input)
-        logprob = logprobs_from_logits(logits[:,:-1,:], model_input[:, 1:])
-
-        #only the generation part of the values/logprobs is needed
-        logprob, vpred = logprob[:, -gen_len:], vpred[:,-gen_len-1:-1]
-
-        vpredclipped = clip_by_value(vpred,
-                                     values - self.ppo_params["cliprange_value"],
-                                     values + self.ppo_params["cliprange_value"])
-
-        vf_losses1 = (vpred - returns)**2
-        vf_losses2 = (vpredclipped - returns)**2
-        vf_loss = .5 * torch.mean(torch.max(vf_losses1, vf_losses2))
-        vf_clipfrac =  torch.mean(torch.gt(vf_losses2, vf_losses1).double())
-
-        ratio = torch.exp(logprob - old_logprobs)
-
-        pg_losses = -advantages * ratio
-        pg_losses2 = -advantages * torch.clamp(ratio,
-                                               1.0 - self.ppo_params['cliprange'],
-                                               1.0 + self.ppo_params['cliprange'])
-
-        pg_loss = torch.mean(torch.max(pg_losses, pg_losses2))
-        pg_clipfrac = torch.mean(torch.gt(pg_losses2, pg_losses).double())
-
-        loss = pg_loss + self.ppo_params['vf_coef'] * vf_loss
-
-        entropy = torch.mean(entropy_from_logits(logits))
-        approxkl = .5 * torch.mean((logprob - old_logprobs)**2)
-        policykl = torch.mean(logprob - old_logprobs)
-        return_mean, return_var = torch.mean(returns), torch.var(returns)
-        value_mean, value_var = torch.mean(values), torch.var(values)
-
-        stats = dict(
-            loss=dict(policy=pg_loss, value=vf_loss, total=loss),
-            policy=dict(entropy=entropy, approxkl=approxkl,policykl=policykl, clipfrac=pg_clipfrac,
-                        advantages=advantages, advantages_mean=torch.mean(advantages), ratio=ratio),
-            returns=dict(mean=return_mean, var=return_var),
-            val=dict(vpred=torch.mean(vpred), error=torch.mean((vpred - returns) ** 2),
-                     clipfrac=vf_clipfrac, mean=value_mean, var=value_var),
-        )
-        return pg_loss, self.ppo_params['vf_coef'] * vf_loss, flatten_dict(stats)
-
-
+    # TODO: Repurpose for ILQL
     def record_step_stats(self, kl_coef, **data):
         """Record training step statistics."""
         kl_list = [logprobs-ref_logprobs for logprobs, ref_logprobs in zip(data['logprobs'], data['ref_logprobs'])]

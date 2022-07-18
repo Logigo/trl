@@ -40,10 +40,10 @@ sentiment_pipe = pipeline("sentiment-analysis","lvwerra/distilbert-imdb", device
 # TODO: Rename and fix models
 gpt2_model = GPT2HeadWithQValueModel.from_pretrained('gpt2')
 gpt2_pi_beta = GPT2HeadWithQValueModel.from_pretrained('gpt2')
-
+print('Loaded GPT Models!')
 gpt2_tokenizer = AutoTokenizer.from_pretrained(ilql_config['model_name'])
 gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
-
+print('Loaded GPT Tokenizer!')
 wandb.watch(gpt2_model, log='all')
 gpt2_model.to(device)
 gpt2_pi_beta.to(device)
@@ -54,15 +54,7 @@ class LengthSampler:
     def __call__(self):
         return np.random.choice(self.values)
     
-input_size = LengthSampler(ilql_config["txt_in_min_len"], ilql_config["txt_in_max_len"])
 output_size = LengthSampler(ilql_config["txt_out_min_len"], ilql_config["txt_out_max_len"])
-
-def tokenize(sample):
-    sample["tokens"] = gpt2_tokenizer.encode(sample["review"])[:input_size()]
-    sample["query"] = gpt2_tokenizer.decode(sample["tokens"])
-    return sample
-
-ds = ds.map(tokenize, batched=False)
 
 gen_kwargs = {
     "min_length":-1,
@@ -72,21 +64,19 @@ gen_kwargs = {
     "pad_token_id": gpt2_tokenizer.eos_token_id
 }
 
-def collater(data):
-    return dict((key, [d[key] for d in data]) for key in data[0])
-
-dataloader = torch.utils.data.DataLoader(ds, batch_size=ilql_config['batch_size'], collate_fn=collater)
 # Training loop
 
 # initialize trainer
 ilql_trainer = ILQLTrainer(gpt2_model, gpt2_tokenizer, **ilql_config)
 
 total_ilql_epochs = int(np.ceil(ilql_config["steps"]/ilql_config['batch_size']))
+datapiece = ["Something is meant to happen"]
 
-for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(dataloader))):
+for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(datapiece))):
     logs, timing = dict(), dict()
     t0 = time.time()
     query_tensors = [torch.tensor(t).long().to(device) for t in batch["tokens"]]
+    
     #### Get response from gpt2
     t = time.time()
     response_tensors = []
@@ -95,7 +85,7 @@ for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(dataloader))):
         response = gpt2_model.generate(query_tensors[i].unsqueeze(dim=0),
                                        max_new_tokens=gen_len, **gen_kwargs)
         response_tensors.append(response.squeeze()[-gen_len:])
-    batch['response'] = [gpt2_tokenizer.decode(r.squeeze()) for r in response_tensors] # This takes so long, why? 
+    batch['response'] = [gpt2_tokenizer.decode(r.squeeze()) for r in response_tensors]
     timing['time/get_response'] = time.time()-t
 
     #### Compute sentiment score
