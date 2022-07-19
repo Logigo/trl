@@ -12,6 +12,7 @@ import time
 import random
 
 from transformers import DataCollatorForLanguageModeling
+from trl.gpt2 import CausalLMOutputWithCrossAttentions
 
 from .core import (logprobs_from_logits,
                       whiten,
@@ -85,6 +86,7 @@ class ILQLTrainer:
                 TODO: Add lambda_Q, lambda_V
 
         """
+        # NOTE: Ilql params are processed here but can have implications in MLP heads' dimensions inside of GPT2, aka, self.model
         self.ilql_params = self.default_params
         self.ilql_params.update(ilql_params)
 
@@ -141,11 +143,8 @@ class ILQLTrainer:
                 #  q_pred (detached): min(model.tq1(s, a), model.tq2(s, a)),
                 #  q1_pred, q2_pred <-- self.q1(s, a)
                 #  v: model.v(s),
-                #  target_v: model.v(next_s) (detached) <-- TODO
                 print(f'Index:{idx} - BS: {bs}')
-                next_v = v[idx + 1] if (idx + 1) < bs else 0.
-                breakpoint()
-                train_stats = self.train_minibatch(logprobs[idx].unsqueeze(0), v[idx].unsqueeze(0), next_v,
+                train_stats = self.train_minibatch(logprobs[idx].unsqueeze(0), v[idx].unsqueeze(0),
                                                     _q[idx].unsqueeze(0), target_q[idx].unsqueeze(0), rewards[idx].unsqueeze(0),
                                                     queries[idx].unsqueeze(0), responses[idx].unsqueeze(0), 
                                                     torch.cat([queries[idx],responses[idx]]).unsqueeze(0))
@@ -173,40 +172,41 @@ class ILQLTrainer:
         bs = self.ilql_params['batch_size']
         fbs = self.ilql_params['forward_batch_size']
         all_logprobs = []
-        all_states = [] # NOTE : TODO - If this is passed into the loss fn, where does V(s') get computed?
-        # In the model, or in the loss fn? Answer - gets passed to train minibatch from line below
         all_values = []
         all_q = []
         all_target_q = []
+        all_attn_masks = []
 
         for i in range(int(bs/fbs)):
             query_batch = queries[i*fbs:(i+1)*fbs]
             response_batch = responses[i*fbs:(i+1)*fbs]
             input_ids = self.data_collator([torch.cat([q, r]) for q, r in zip(query_batch, response_batch)])["input_ids"]
             with torch.no_grad():
-                # TODO: q1 and q2 should have min taken
-                logits, _, v, q1, q2, target_q1, target_q2 = self.model(input_ids)
-                # TODO: Is this the right function?
+                # LM Output
+                lmo: CausalLMOutputWithCrossAttentions = self.model(input_ids)
+                logits, attn_masks, v, q1, q2, target_q1, target_q2 = lmo.logits, lmo.attentions, lmo.value, lmo.qs[0], lmo.qs[1], lmo.target_qs[0], lmo.target_qs[1]
                 q = torch.minimum(q1, q2)
                 target_q = torch.minimum(target_q1, target_q2)
-                # ref_logits, _, _ = self.ref_model(input_ids)
             # TODO: What is happening with the indices here?
             logprobs = logprobs_from_logits(logits[:,:-1,:], input_ids[:,1:])
-            # ref_logprobs = logprobs_from_logits(ref_logits[:,:-1,:], input_ids[:,1:])
-            for j in range(fbs):
+            # TODO: Inspect fbs and bs/fbs etc. to figure out indexing
+            for j in range(fbs): 
                 start = len(query_batch[j])-1
                 end = len(query_batch[j]) + len(response_batch[j])-1
-                # TODO: Is this right? Who knows!
+                # TODO: Is this right? Who knows! Where is the indexing from?
                 all_q.append(q[j, start-1:end-1])
                 all_target_q.append(target_q[j, start-1:end-1])
                 all_values.append(v[j, start-1:end-1])
+                all_attn_masks.append(attn_masks[j, start-1:end-1]) # Is indexing right? For any of these?
                 all_logprobs.append(logprobs[j, start:end])
+
         return all_logprobs, all_values, all_q, all_target_q
 
 
     # TODO: Arguments need to be changed. 
-    def train_minibatch(self, logprob, value, next_value, q, target_q, reward, query, response, model_input):
-        loss, train_stats = self.ilql_loss(logprob, value, next_value, q, target_q, reward, query, response, model_input)
+    # TODO: Check if rewards is 1 value or not.
+    def train_minibatch(self, logprobs, values, qs, target_qs, rewards, query, response, model_input):
+        loss, train_stats = self.ilql_loss(logprobs, values, qs, target_qs, rewards, query, response, model_input)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -216,6 +216,7 @@ class ILQLTrainer:
         # R(s, a) + V(s_i+1) - Q(s, a) <-- squared
         # +
         # Expectile loss(Q_hat(s, a) - V(s) )
+        # TODO - Should this be passed as an arg?
         gamma = self.ilql_params['gamma']
         L_Q = (reward + (gamma * next_value) - q) ** 2
         # Expectile Regression: - I wrote this to be as readable as possible.
@@ -227,7 +228,7 @@ class ILQLTrainer:
         # is applied on the whole batch at the same time (like, implementation wise), whereas the loss fn here takes 1 entry at a time
         return L_Q + L_V, {}
 
-    def L_CQL(self, values, rewards, query, response, model_input):
+    def L_CQL(self, q, qs):
         """
         if self.double_q:
             q1, q2 = qs
@@ -244,15 +245,39 @@ class ILQLTrainer:
         I am not quite sure what the lines above me mean (https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L366-L369)
         But I am working on it
         """
-
+        # TODO: How do I get action tokens? Is it from GPT2? Maybe its already part of q, from the Q Head hidden size? but that wouldn't make sense
+        # EDIT: Turns out I don't need them for per utterance, only for pertoken. I am not sure which version of ILQL we are doing but I will implement both.
+        #  For PerToken, previous comment is right - it is part of Q Head's hidden size that is configured to be vocab_size, particularly for PerToken, which is 
+        #  what uses CCE Loss over the actions (or vocab)
         return None, {}
 
-    def ilql_loss(self, old_logprob, value, next_value, q, target_q, rewards, query, response, model_input):
-        breakpoint()
-        qv_loss, qv_stats = self.L_QV(value, next_value, q, target_q, rewards)
-        cql_loss, cql_stats = self.L_CQL(value, rewards, query, response, model_input)
-        stats = {qv_stats, cql_stats} # TODO: What is this?
-        return qv_loss + (self.ilql_params['alpha'] * cql_loss), flatten_dict(stats)
+    # TODO: Figure out args from what Charlie says. ILQL has them as (tokens, attn_mask, logits, w). I found out where to get attn_mask from, but I'm not sure if it's coming
+    # from the right transformer (2nd transformer for target_q doesn't exist as of now).
+
+    #  If this is just for PerToken, what are the token arguments in this case?
+    # TODO: https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/utterance_iql_model.py#L201
+    # Utterance ILQL uses AWAC, L_Q, L_V
+    # Token ILQL uses AWAC, L_Q, L_V, L_CQL, DM_Loss (What is DM Loss? :-( )
+    #  https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L476
+    def L_AWAC(self):
+        pass
+    
+    def ilql_loss(self, old_logprobs, values, qs, target_qs, rewards, query, response, model_input):
+        # TODO : Document this as a loss function that gets applied to a batch of values, qs, and target_qs, as opposed to 1 number of each.
+        sequence_len = len(values)
+        # assert len(values) == len(qs) == len(target_qs) # TODO: Dangerous assertion?
+        stats = {}
+        total_losses = []
+        for i in range(sequence_len):
+            next_value = values[i + 1] if i + 1 < sequence_len else 0.
+            value, q, target_q, reward = values[i], q[i], target_qs[i], rewards[i]
+            qv_loss, qv_stats = self.L_QV(value, next_value, q, target_q, reward)
+            cql_loss, cql_stats = self.L_CQL(q, qs)
+            total_losses.append(qv_loss + (self.ilql_params['alpha'] * cql_loss))
+            # TODO: Update stats dicts
+        # TODO: In the IQL implementation, batch-wise loss is averaged via .mean(). What should we do here? 
+        #  See: https://github.com/rail-berkeley/rlkit/blob/master/rlkit/torch/sac/iql_trainer.py#L166
+        return total_losses, flatten_dict(stats)
 
     # TODO: Repurpose for ILQL
     def record_step_stats(self, kl_coef, **data):

@@ -37,8 +37,8 @@ sent_kwargs = {
 sentiment_pipe = pipeline("sentiment-analysis","lvwerra/distilbert-imdb", device=pipe_device)
 # get models
 
-# TODO: Rename and fix models
-gpt2_model = GPT2HeadWithQValueModel.from_pretrained('gpt2')
+# TODO: Find a way to pass PerUtterance OR PerToken to GPT2 Model
+gpt2_model = GPT2HeadWithQValueModel(utterance=False).from_pretrained('gpt2')
 gpt2_pi_beta = GPT2HeadWithQValueModel.from_pretrained('gpt2')
 
 gpt2_tokenizer = AutoTokenizer.from_pretrained(ilql_config['model_name'])

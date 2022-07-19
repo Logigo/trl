@@ -28,57 +28,6 @@ class CausalLMOutputWithCrossAttentions(ModelOutput):
     target_qs: Optional[Tuple[torch.FloatTensor]] = None
 
 # Cell
-
-class ValueHead(nn.Module):
-    """
-    The ValueHead class implements a head for GPT2 that returns a scalar for each output token.
-    TODO: For ILQL;
-    "Each head has two layers, with a hidden dimension twice that of the transformer’s embedding dimension"
-    How would this change this piece of code? I don't see any layers, or how to find the transformer's embedding dimension. 
-    ^ I think I figured this part out. 
-    """
-    # TODO: Change this to have 2 Linear Layers and follow ILQL paper instructions
-    def __init__(self, config):
-        super().__init__()
-        self.detach_head = False
-        self.summary_type = config.summary_type if hasattr(config, "summary_type") else "last"
-        if self.summary_type == "attn":
-            raise NotImplementedError
-
-        self.summary = Identity()
-        if hasattr(config, "summary_use_proj") and config.summary_use_proj:
-            if hasattr(config, "summary_proj_to_labels") and config.summary_proj_to_labels and config.num_labels > 0:
-                num_classes = config.num_labels
-            else:
-                num_classes = config.hidden_size
-            self.summary = nn.Linear(config.hidden_size, num_classes)
-
-        self.activation = Identity()
-        if hasattr(config, "summary_activation") and config.summary_activation == "tanh":
-            self.activation = nn.Tanh()
-
-        self.first_dropout = Identity()
-        if hasattr(config, "summary_first_dropout") and config.summary_first_dropout > 0:
-            self.first_dropout = nn.Dropout(config.summary_first_dropout)
-
-        self.last_dropout = Identity()
-        if hasattr(config, "summary_last_dropout") and config.summary_last_dropout > 0:
-            self.last_dropout = nn.Dropout(config.summary_last_dropout)
-
-        self.flatten = nn.Flatten()
-
-    def forward(self, hidden_states, cls_index=None):
-        if self.detach_head:
-            output = hidden_states.detach()
-        else:
-            output = hidden_states
-        output = self.first_dropout(output)
-        output = self.summary(output)
-        output = self.activation(output)
-        output = self.last_dropout(output)
-
-        return output
-
 # Cell
 # TODO: This is the Value Function Transformer (I assume). In the ILQL paper, it says:
 # Our value function transformer has three MLP heads: two independently initialized and trained Q heads and one V head. 
@@ -94,14 +43,14 @@ So I need 3 transformers? What is a supervised learning policy?
 
 '''
 
-class QHead(nn.Module): 
-    def __init__(self, config) -> None:
+class MLPHead(nn.Module): 
+    def __init__(self, config, output_size=1) -> None:
         super().__init__()
         # TODO: Should I detach head ever?
         self.hidden_dimension = config.n_embd
         self.linear_1 = nn.Linear(self.hidden_dimension, self.hidden_dimension*2)
         self.non_linearity = nn.ReLU()
-        self.linear_2 = nn.Linear(self.hidden_dimension*2, 1)
+        self.linear_2 = nn.Linear(self.hidden_dimension*2, output_size)
         # nn.Linear(self.h_dim*2, self.dataset.tokenizer.num_tokens()), <-- This is how it is on the ILQL Code for a Q Head. But where do I find num_tokens?
         # TODO: Whether we use num_tokens() or 1 as an output dimension depends on if it is PerToken (1) or PerUtterance (num_tokens())
     def forward(self, x):
@@ -112,18 +61,21 @@ class QHead(nn.Module):
 
 class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
     """The GPT2HeadWithValueModel class implements a GPT2 language model with a secondary, scalar head."""
-    def __init__(self, config):
+    # TODO: How do I add arguments to config from outside the 
+    def __init__(self, config, utterance=True):
         super().__init__(config)
         config.num_labels = 1
+
+        self.num_tokens = config.vocab_size if not utterance else 1
         self.transformer = GPT2Model(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.q1 = QHead(config)
-        self.q2 = QHead(config)
+        self.q1 = MLPHead(config, output_size=self.num_tokens)
+        self.q2 = MLPHead(config, output_size=self.num_tokens)
 
-        self.target_q1 = QHead(config)
-        self.target_q2 = QHead(config)
+        self.target_q1 = MLPHead(config, output_size=self.num_tokens)
+        self.target_q2 = MLPHead(config, output_size=self.num_tokens)
 
-        self.v_head = ValueHead(config)
+        self.v_head = MLPHead(config, output_size=1)
         # TODO: I should add two "independently initialized and trained Q heads"? Does this mean I make a different class, QHead? Or re-use ValueHead?
         # TODO: "Our target Q networks are Polyak-averaged with decay factor 0.005 for both the transformer and the Q function head"
         #   ^ What does this mean?
@@ -150,7 +102,7 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
         mc_token_ids=None,
         lm_labels=None,
         mc_labels=None,
-        return_dict=False,
+        return_dict=True,
         output_attentions=False,
         output_hidden_states=False,
     ):
@@ -191,14 +143,14 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
 
         # What is this ? How would this change since I added the 2 Q Heads from the paper?
         return CausalLMOutputWithCrossAttentions(
-            loss=loss, # Who is that?
-            logits=lm_logits, # What is this?
+            loss=loss,
+            logits=lm_logits,
             past_key_values=transformer_outputs.past_key_values, # What!
             hidden_states=transformer_outputs.hidden_states, # WHO?!
-            attentions=transformer_outputs.attentions, # Why!
+            attentions=transformer_outputs.attentions, # Why! NOTE: BECAUSE OF UTTERANCE!
             cross_attentions=transformer_outputs.cross_attentions, # I don't understand.
             value=value,
-            qs=(q1, q2), # Do tuples belong here? Do *I* belong here?
+            qs=(q1, q2),
             target_qs=(target_q1, target_q2)
         )
 

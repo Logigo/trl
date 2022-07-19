@@ -148,6 +148,7 @@ class PPOTrainer:
 
         t = time.time()
         all_stats = []
+        
         idxs = list(range(bs))
         for _ in range(self.ppo_params['ppo_epochs']):
             random.shuffle(idxs)
