@@ -187,13 +187,12 @@ class ILQLTrainer:
             query_batch = queries[i*fbs:(i+1)*fbs]
             response_batch = responses[i*fbs:(i+1)*fbs]
             input_ids = self.data_collator([torch.cat([q, r]) for q, r in zip(query_batch, response_batch)])["input_ids"]
+            # LM Output
             with torch.no_grad():
-                # LM Output
-                # Transformers get passed Query+Response. Its outputs will be used to propagate gradients in train_minibatch
                 lmo: CausalLMOutputWithCrossAttentions = self.model(input_ids)
-                logits, attn_masks, v, q1, q2, target_q1, target_q2 = lmo.logits, lmo.attentions, lmo.value, lmo.qs[0], lmo.qs[1], lmo.target_qs[0], lmo.target_qs[1]
-                q = torch.minimum(q1, q2)
-                target_q = torch.minimum(target_q1, target_q2)
+            logits, attn_masks, v, q1, q2, target_q1, target_q2 = lmo.logits, lmo.attentions, lmo.value, lmo.qs[0], lmo.qs[1], lmo.target_qs[0], lmo.target_qs[1]
+            q = torch.minimum(q1, q2)
+            target_q = torch.minimum(target_q1, target_q2)
             # TODO: What is happening with the indices here?
             logprobs = logprobs_from_logits(logits[:,:-1,:], input_ids[:,1:])
             # TODO: Inspect fbs and bs/fbs etc. to figure out indexing
@@ -216,15 +215,17 @@ class ILQLTrainer:
     def train_minibatch(self, logprobs, values, qs, target_qs, rewards, query, response, model_input):
         train_stats = {}
         loss, loss_step_stats = self.ilql_loss(logprobs, values, qs, target_qs, rewards, query, response, model_input)
+        # Experimental haha
+        loss_scalar = loss.sum()
         # TODO: This is just a syntactically correct placeholder I guess
         train_stats.update(loss_step_stats)
         # What's the point of having batches if I will propagate gradients with every input?
         self.optimizer.zero_grad()
-        loss.backward()
+        loss_scalar.backward()
         self.optimizer.step()
         return train_stats
 
-    def L_QV(self, value, next_value, q, target_q, reward):
+    def L_QV(self, value, next_value, q, q_hat, reward):
         # R(s, a) + V(s_i+1) - Q(s, a) <-- squared
         # +
         # Expectile loss(Q_hat(s, a) - V(s) )
@@ -233,7 +234,7 @@ class ILQLTrainer:
         q_target = reward + (gamma * next_value) # Not to be confused with the result of the target_Q transformer. 
         L_Q = (q_target - q) ** 2
         # Expectile Regression: - I wrote this to be as readable as possible.
-        u = (value - target_q) # Q_hat - V, but flipped
+        u = (value - q_hat) # Q_hat - V, but flipped
         ones, zeros = torch.ones(u.shape), torch.zeros(u.shape)
         fancy_one_symbol = torch.where(u > 0, ones, zeros) # Usually, this is 1 if u < 0, but we flipped it cause we are minimizing and not maximizing, therefore u is a negative number
         tau = self.ilql_params['tau']

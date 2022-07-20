@@ -144,9 +144,9 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
         q2 = self.q2(action_hidden_states).squeeze(-1)
         # TODO: These should have no_grad() according to 
         #  https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L294
-        with torch.no_grad():
-            target_q1 = self.target_q1(action_target_hidden_states).squeeze(-1)
-            target_q2 = self.target_q2(action_target_hidden_states).squeeze(-1)
+       
+        target_q1 = self.target_q1(action_target_hidden_states).squeeze(-1)
+        target_q2 = self.target_q2(action_target_hidden_states).squeeze(-1)
 
         if not return_dict:
             outputs = (lm_logits,) + transformer_outputs[1:] + (value,) + (q1,) + (q2,) + (target_q1,) + (target_q2,)
