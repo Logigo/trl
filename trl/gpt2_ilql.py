@@ -61,7 +61,7 @@ class MLPHead(nn.Module):
 class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
     """The GPT2HeadWithValueModel class implements a GPT2 language model with a secondary, scalar head."""
     # TODO: How do I add arguments to config from outside the 
-    def __init__(self, config, utterance=True):
+    def __init__(self, config, utterance=False):
         super().__init__(config)
         config.num_labels = 1
 

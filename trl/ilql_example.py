@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 # NOTE: Straight up copied from https://github.com/lvwerra/trl/blob/master/nbs/04-gpt2-sentiment-ppo-training.ipynb
 ilql_config = {
-    'steps': 2, 'batch_size': 2, 'forward_batch_size': 2, 'model_name': 'lvwerra/gpt2-imdb', 
+    'steps': 2, 'batch_size': 6, 'forward_batch_size': 3, 'model_name': 'lvwerra/gpt2-imdb', 
     "txt_in_min_len": 2, "txt_in_max_len": 8, "txt_out_min_len": 4, "txt_out_max_len": 16
 }
 
@@ -38,7 +38,7 @@ sentiment_pipe = pipeline("sentiment-analysis","lvwerra/distilbert-imdb", device
 # get models
 
 # TODO: Find a way to pass PerUtterance OR PerToken to GPT2 Model
-gpt2_model = GPT2HeadWithQValueModel(utterance=False).from_pretrained('gpt2')
+gpt2_model = GPT2HeadWithQValueModel.from_pretrained('gpt2')
 gpt2_pi_beta = GPT2HeadWithQValueModel.from_pretrained('gpt2')
 
 gpt2_tokenizer = AutoTokenizer.from_pretrained(ilql_config['model_name'])
