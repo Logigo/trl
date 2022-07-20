@@ -257,7 +257,7 @@ class ILQLTrainer:
         # TODO: What is q and what is qs in PerToken example?
         numerator = torch.exp(q) # Q of the current action - how do I get that?
         denominator = torch.sum(
-            torch.exp(q) # Is q<--Q(s,a) and qs a listlike of q(s,a'), forall a' in A?
+            torch.exp(q) # Is q<--Q(s,a) and qs a listlike of q(s,a'), forall a' in A? OR: Is q a 1*vocab_size tensor?
         )
         cql = torch.log(
             torch.divide(numerator, denominator)

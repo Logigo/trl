@@ -116,6 +116,7 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
             inputs_embeds=inputs_embeds,
         )
         # A.3 from ILQL: "The target Q network is also on a separate transformer"
+        # NOTE: Does the target Q take input_ids?
         target_transformer_outputs = self.target_transformer(
             input_ids,
             past_key_values=past_key_values,
