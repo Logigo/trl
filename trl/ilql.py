@@ -119,7 +119,7 @@ class ILQLTrainer:
 
         t = time.time()
         # Named it _q not q so i can use pdb lol
-        logprobs, v, _q, target_q = self.batched_forward_pass(queries, responses)
+        logprobs, v, _q, target_q, attn_masks = self.batched_forward_pass(queries, responses)
         timing['time/ilql/forward_pass'] = time.time()-t
 
         t = time.time()
@@ -176,6 +176,8 @@ class ILQLTrainer:
         all_q = []
         all_target_q = []
         all_attn_masks = []
+        # NOTE: Should this exist? I am thinking to have it so I can pass next states to compute target_q
+        all_states = []
 
         for i in range(int(bs/fbs)):
             query_batch = queries[i*fbs:(i+1)*fbs]
@@ -183,6 +185,7 @@ class ILQLTrainer:
             input_ids = self.data_collator([torch.cat([q, r]) for q, r in zip(query_batch, response_batch)])["input_ids"]
             with torch.no_grad():
                 # LM Output
+                # Transformers get passed Query+Response. Its outputs will be used to propagate gradients in train_minibatch
                 lmo: CausalLMOutputWithCrossAttentions = self.model(input_ids)
                 logits, attn_masks, v, q1, q2, target_q1, target_q2 = lmo.logits, lmo.attentions, lmo.value, lmo.qs[0], lmo.qs[1], lmo.target_qs[0], lmo.target_qs[1]
                 q = torch.minimum(q1, q2)
@@ -200,7 +203,7 @@ class ILQLTrainer:
                 all_attn_masks.append(attn_masks[j, start-1:end-1]) # Is indexing right? For any of these?
                 all_logprobs.append(logprobs[j, start:end])
 
-        return all_logprobs, all_values, all_q, all_target_q
+        return all_logprobs, all_values, all_q, all_target_q, all_attn_masks
 
 
     # TODO: Arguments need to be changed. 
@@ -218,7 +221,8 @@ class ILQLTrainer:
         # Expectile loss(Q_hat(s, a) - V(s) )
         # TODO - Should this be passed as an arg?
         gamma = self.ilql_params['gamma']
-        L_Q = (reward + (gamma * next_value) - q) ** 2
+        q_target = reward + (gamma * next_value) # Not to be confused with the result of the target_Q transformer. 
+        L_Q = (q_target - q) ** 2
         # Expectile Regression: - I wrote this to be as readable as possible.
         u = (value - target_q) # Q_hat - V, but flipped
         fancy_one_symbol = 1. if u > 0 else 0. # Usually, this is 1 if u < 0, but we flipped it cause we are minimizing and not maximizing, therefore u is a negative number
@@ -249,7 +253,17 @@ class ILQLTrainer:
         # EDIT: Turns out I don't need them for per utterance, only for pertoken. I am not sure which version of ILQL we are doing but I will implement both.
         #  For PerToken, previous comment is right - it is part of Q Head's hidden size that is configured to be vocab_size, particularly for PerToken, which is 
         #  what uses CCE Loss over the actions (or vocab)
-        return None, {}
+        # TODO: Now all that's left is to set a breakpoint here and call cross entropy on the right Qs:or just
+        # TODO: What is q and what is qs in PerToken example?
+        numerator = torch.exp(q) # Q of the current action - how do I get that?
+        denominator = torch.sum(
+            torch.exp(q) # Is q<--Q(s,a) and qs a listlike of q(s,a'), forall a' in A?
+        )
+        cql = torch.log(
+            torch.divide(numerator, denominator)
+        )
+        # We return CQL in expectation 
+        return cql.mean(), {}
 
     # TODO: Figure out args from what Charlie says. ILQL has them as (tokens, attn_mask, logits, w). I found out where to get attn_mask from, but I'm not sure if it's coming
     # from the right transformer (2nd transformer for target_q doesn't exist as of now).

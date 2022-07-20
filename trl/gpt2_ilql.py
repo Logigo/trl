@@ -51,7 +51,6 @@ class MLPHead(nn.Module):
         self.linear_1 = nn.Linear(self.hidden_dimension, self.hidden_dimension*2)
         self.non_linearity = nn.ReLU()
         self.linear_2 = nn.Linear(self.hidden_dimension*2, output_size)
-        # nn.Linear(self.h_dim*2, self.dataset.tokenizer.num_tokens()), <-- This is how it is on the ILQL Code for a Q Head. But where do I find num_tokens?
         # TODO: Whether we use num_tokens() or 1 as an output dimension depends on if it is PerToken (1) or PerUtterance (num_tokens())
     def forward(self, x):
         x = self.linear_1(x)
@@ -72,13 +71,13 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
         self.q1 = MLPHead(config, output_size=self.num_tokens)
         self.q2 = MLPHead(config, output_size=self.num_tokens)
 
+        # TODO: "Our target Q networks are Polyak-averaged with decay factor 0.005 for both the transformer and the Q function head"
+        #   ^ What does this mean?
+        self.target_transformer = GPT2Model(config)
         self.target_q1 = MLPHead(config, output_size=self.num_tokens)
         self.target_q2 = MLPHead(config, output_size=self.num_tokens)
 
         self.v_head = MLPHead(config, output_size=1)
-        # TODO: I should add two "independently initialized and trained Q heads"? Does this mean I make a different class, QHead? Or re-use ValueHead?
-        # TODO: "Our target Q networks are Polyak-averaged with decay factor 0.005 for both the transformer and the Q function head"
-        #   ^ What does this mean?
 
 
         self.init_weights()
@@ -116,11 +115,22 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
         )
+        # A.3 from ILQL: "The target Q network is also on a separate transformer"
+        target_transformer_outputs = self.target_transformer(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+        )
 
         hidden_states = transformer_outputs[0]
         state_hidden_states = torch.clone(hidden_states)
         action_hidden_states = torch.clone(hidden_states)
-        action_target_hidden_states = torch.clone(hidden_states)
+        target_hidden_states = target_transformer_outputs[0]
+        action_target_hidden_states = torch.clone(target_hidden_states)
         lm_logits = self.lm_head(hidden_states)
 
         value = self.v_head(state_hidden_states).squeeze(-1)
