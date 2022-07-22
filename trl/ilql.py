@@ -12,7 +12,7 @@ import time
 import random
 
 from transformers import DataCollatorForLanguageModeling
-from trl.gpt2 import CausalLMOutputWithCrossAttentions
+from trl.gpt2_ilql import CausalLMOutputWithCrossAttentions, GPT2HeadWithQValueModel
 
 from .core import (logprobs_from_logits,
                       whiten,
@@ -65,8 +65,8 @@ class ILQLTrainer:
         "gamma": 0.99, # From the paper, A.3
         "alpha": 0.1,
         "tau": 0.7,
-        "polyak_decay": 0.005
-
+        "polyak_decay": 0.005,
+        'target_update_frequency': 10, # TODO: Find it from the paper, I pulled this number out of nowhere. 
     }
 
     def __init__(self, model, tokenizer, **ilql_params):
@@ -90,11 +90,12 @@ class ILQLTrainer:
         self.ilql_params = self.default_params
         self.ilql_params.update(ilql_params)
 
-        self.model = model
+        self.model: GPT2HeadWithQValueModel = model
         self.tokenizer = tokenizer
         self.data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
         self.optimizer = Adam(model.parameters(), lr=self.ilql_params['lr'])
+        self.step_count = 0
 
     def step(self, queries, responses, scores):
         """
@@ -108,7 +109,6 @@ class ILQLTrainer:
         returns:
             train_stats (dict): a summary of the training statistics
         """
-        # TODO: Where does the GPT2HeadWithQValueModel tie into this?
         bs = self.ilql_params['batch_size']
         assert bs == len(queries), f"Batch size ({bs}) does not match number of examples ({len(queries)})"
 
@@ -155,6 +155,13 @@ class ILQLTrainer:
                 all_stats.append(train_stats)
         timing['time/ilql/optimize_step'] = time.time()-t
 
+        # Update targets
+        if self.step_count + 1 % self.ilql_params['target_update_frequency'] == 0:
+            t = time.time()
+            # Uses EMA to update target q network
+            self.model.soft_update_targets(alpha=self.ilql_params['polyak_decay'])
+            train_stats['time/ilql/target_update'] = time.time()-t
+
         t = time.time()
         train_stats = stack_dicts(all_stats)
 
@@ -169,6 +176,7 @@ class ILQLTrainer:
         timing['time/ilql/calc_stats'] = time.time()-t
         timing['time/ilql/total'] = time.time()-t0
         stats.update(timing)
+        self.step_count += 1
         return stats
 
     def batched_forward_pass(self, queries, responses):
@@ -188,8 +196,8 @@ class ILQLTrainer:
             response_batch = responses[i*fbs:(i+1)*fbs]
             input_ids = self.data_collator([torch.cat([q, r]) for q, r in zip(query_batch, response_batch)])["input_ids"]
             # LM Output
-            with torch.no_grad():
-                lmo: CausalLMOutputWithCrossAttentions = self.model(input_ids)
+            # TODO: No grad the forward pass?
+            lmo: CausalLMOutputWithCrossAttentions = self.model(input_ids)
             logits, attn_masks, v, q1, q2, target_q1, target_q2 = lmo.logits, lmo.attentions, lmo.value, lmo.qs[0], lmo.qs[1], lmo.target_qs[0], lmo.target_qs[1]
             q = torch.minimum(q1, q2)
             target_q = torch.minimum(target_q1, target_q2)
@@ -208,7 +216,6 @@ class ILQLTrainer:
                 all_logprobs.append(logprobs[j, start:end])
 
         return all_logprobs, all_values, all_q, all_target_q, all_attn_masks
-
 
     # TODO: Arguments need to be changed. 
     # TODO: Check if rewards is 1 value or not.

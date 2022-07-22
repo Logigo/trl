@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import torch
 from dataclasses import dataclass
 from typing import Optional, Tuple
+import copy
 
 # Cell
 @dataclass
@@ -64,16 +65,20 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
     def __init__(self, config, utterance=False):
         super().__init__(config)
         config.num_labels = 1
-
+        # n_embd = 768
+        # vocab_size = 50257,
+        # eos and bos token id = 50256
         self.num_tokens = config.vocab_size if not utterance else 1
         self.transformer = GPT2Model(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Q Head
         self.q1 = MLPHead(config, output_size=self.num_tokens)
         self.q2 = MLPHead(config, output_size=self.num_tokens)
 
+        # Target transformer is initialized as a copy of self.transformer
+        self.target_transformer = copy.deepcopy(self.transformer)
         # TODO: "Our target Q networks are Polyak-averaged with decay factor 0.005 for both the transformer and the Q function head"
         #   ^ What does this mean?
-        self.target_transformer = GPT2Model(config)
         self.target_q1 = MLPHead(config, output_size=self.num_tokens)
         self.target_q2 = MLPHead(config, output_size=self.num_tokens)
 
@@ -88,6 +93,32 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
     # TODO: What does this mean? Is this just detatching it from propagating gradients?
     def detach_value_head(self):
         self.v_head.detach_head = True
+
+    def soft_update_targets(self, alpha):
+        stats = {}
+        def _copy_parameters_ema(target, copy):
+            nonlocal stats, alpha
+            for target_param, copy_param in zip(target.parameters(), copy.parameters()):
+                ema_copy_param = (alpha * copy_param.data) + (1.0 - alpha)*target_param.data
+                target_param.data.copy_(ema_copy_param)
+        """
+        for target_param, local_param in zip(self.target_q.parameters(), self.q.parameters()):
+            target_param.data.copy_(self.alpha*local_param.data + (1.0-self.alpha)*target_param.data)
+        if self.double_q:
+            for target_param, local_param in zip(self.target_q2.parameters(), self.q2.parameters()):
+                target_param.data.copy_(self.alpha*local_param.data + (1.0-self.alpha)*target_param.data)
+        if self.lm_target is not None:
+            for target_param, local_param in zip(self.lm_target.parameters(), self.model.parameters()):
+                target_param.data.copy_(self.alpha*local_param.data + (1.0-self.alpha)*target_param.data)"""
+        # TODO: Which one are we? We are double Q, and lm_target is not none (on a diff transformer).
+        #  Refer to: https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L141
+        # Copy target_q1<--q1
+        tq1_stats = _copy_parameters_ema(self.target_q1, self.q1)
+        # Copy target_q2<--q2
+        tq2_stats = _copy_parameters_ema(self.target_q2, self.q2)
+        # Copy target_transformer<--transformer
+        tformer_stats = _copy_parameters_ema(self.target_transformer, self.transformer)
+        return (tq1_stats, tq2_stats, tformer_stats)
 
     def forward(
         self,
@@ -115,27 +146,33 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
         )
+
+        hidden_states = transformer_outputs[0] # [1, len(input_ids), 50257], which indices are action and state hidden states?
+        # h_dim = n_embd = 768
+        # What does this mean below? What would state_idxs/action_idxs be?
+        """state_hidden_states = torch.gather(input=hidden_states, dim=1, index=state_idxs.unsqueeze(2).repeat(1, 1, self.h_dim))"""
+        state_hidden_states = torch.clone(hidden_states)
+        """action_hidden_states = torch.gather(input=hidden_states, dim=1, index=action_idxs.unsqueeze(2).repeat(1, 1, self.h_dim))"""
+        action_hidden_states = torch.clone(hidden_states)
+        lm_logits = self.lm_head(hidden_states)
+        
         # A.3 from ILQL: "The target Q network is also on a separate transformer"
         # NOTE: Does the target Q take input_ids?
-        target_transformer_outputs = self.target_transformer(
-            input_ids,
-            past_key_values=past_key_values,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = transformer_outputs[0]
-        state_hidden_states = torch.clone(hidden_states)
-        action_hidden_states = torch.clone(hidden_states)
+        with torch.no_grad():
+            target_transformer_outputs = self.target_transformer(
+                input_ids,
+                past_key_values=past_key_values,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+            )
         target_hidden_states = target_transformer_outputs[0]
+        """action_target_hidden_states = torch.gather(input=target_hidden_states, dim=1, index=action_idxs.unsqueeze(2).repeat(1, 1, self.h_dim))"""
         action_target_hidden_states = torch.clone(target_hidden_states)
-        lm_logits = self.lm_head(hidden_states)
 
         value = self.v_head(state_hidden_states).squeeze(-1)
-
         # TODO: I just copied the line above. Most likely incorrect. 
         # Polyak averaged Q Heads
         # TODO: The Q should take action_hidden states, but the value should take the state hidden state. Why? Look at 287-291:
@@ -144,26 +181,26 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
         q2 = self.q2(action_hidden_states).squeeze(-1)
         # TODO: These should have no_grad() according to 
         #  https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L294
-       
-        target_q1 = self.target_q1(action_target_hidden_states).squeeze(-1)
-        target_q2 = self.target_q2(action_target_hidden_states).squeeze(-1)
+        with torch.no_grad():
+            target_q1 = self.target_q1(action_target_hidden_states).squeeze(-1)
+            target_q2 = self.target_q2(action_target_hidden_states).squeeze(-1)
 
         if not return_dict:
             outputs = (lm_logits,) + transformer_outputs[1:] + (value,) + (q1,) + (q2,) + (target_q1,) + (target_q2,)
             return outputs
 
-        # What is this ? How would this change since I added the 2 Q Heads from the paper?
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
-            past_key_values=transformer_outputs.past_key_values, # What!
-            hidden_states=transformer_outputs.hidden_states, # WHO?!
-            attentions=transformer_outputs.attentions, # Why! NOTE: BECAUSE OF UTTERANCE!
-            cross_attentions=transformer_outputs.cross_attentions, # I don't understand.
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states, 
+            attentions=transformer_outputs.attentions,
+            cross_attentions=transformer_outputs.cross_attentions,
             value=value,
             qs=(q1, q2),
             target_qs=(target_q1, target_q2)
         )
+    
 
 # Cell
 
