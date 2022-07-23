@@ -28,6 +28,7 @@ class CausalLMOutputWithCrossAttentions(ModelOutput):
     qs: Optional[Tuple[torch.FloatTensor]] = None
     target_qs: Optional[Tuple[torch.FloatTensor]] = None
 
+torch.autograd.set_detect_anomaly(True)
 # Cell
 # Cell
 # TODO: This is the Value Function Transformer (I assume). In the ILQL paper, it says:
@@ -53,11 +54,12 @@ class MLPHead(nn.Module):
         self.non_linearity = nn.ReLU()
         self.linear_2 = nn.Linear(self.hidden_dimension*2, output_size)
         # TODO: Whether we use num_tokens() or 1 as an output dimension depends on if it is PerToken (1) or PerUtterance (num_tokens())
-    def forward(self, x):
-        x = self.linear_1(x)
+    def forward(self, input):
+        x = self.linear_1(input)
         x = self.non_linearity(x)
         x = self.linear_2(x)
-        return x
+        # TODO: Return this to x in case it doesn't solve inplace runtime error
+        return self.linear_2(self.non_linearity(self.linear_1(input)))
 
 class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
     """The GPT2HeadWithValueModel class implements a GPT2 language model with a secondary, scalar head."""
@@ -101,24 +103,14 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
             for target_param, copy_param in zip(target.parameters(), copy.parameters()):
                 ema_copy_param = (alpha * copy_param.data) + (1.0 - alpha)*target_param.data
                 target_param.data.copy_(ema_copy_param)
-        """
-        for target_param, local_param in zip(self.target_q.parameters(), self.q.parameters()):
-            target_param.data.copy_(self.alpha*local_param.data + (1.0-self.alpha)*target_param.data)
-        if self.double_q:
-            for target_param, local_param in zip(self.target_q2.parameters(), self.q2.parameters()):
-                target_param.data.copy_(self.alpha*local_param.data + (1.0-self.alpha)*target_param.data)
-        if self.lm_target is not None:
-            for target_param, local_param in zip(self.lm_target.parameters(), self.model.parameters()):
-                target_param.data.copy_(self.alpha*local_param.data + (1.0-self.alpha)*target_param.data)"""
-        # TODO: Which one are we? We are double Q, and lm_target is not none (on a diff transformer).
-        #  Refer to: https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L141
+
         # Copy target_q1<--q1
-        tq1_stats = _copy_parameters_ema(self.target_q1, self.q1)
+        _copy_parameters_ema(self.target_q1, self.q1)
         # Copy target_q2<--q2
-        tq2_stats = _copy_parameters_ema(self.target_q2, self.q2)
+        _copy_parameters_ema(self.target_q2, self.q2)
         # Copy target_transformer<--transformer
-        tformer_stats = _copy_parameters_ema(self.target_transformer, self.transformer)
-        return (tq1_stats, tq2_stats, tformer_stats)
+        _copy_parameters_ema(self.target_transformer, self.transformer)
+        return stats
 
     def forward(
         self,
@@ -172,21 +164,22 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
         """action_target_hidden_states = torch.gather(input=target_hidden_states, dim=1, index=action_idxs.unsqueeze(2).repeat(1, 1, self.h_dim))"""
         action_target_hidden_states = torch.clone(target_hidden_states)
 
-        value = self.v_head(state_hidden_states).squeeze(-1)
+        value = self.v_head(state_hidden_states.detach()).squeeze(-1)
         # TODO: I just copied the line above. Most likely incorrect. 
         # Polyak averaged Q Heads
         # TODO: The Q should take action_hidden states, but the value should take the state hidden state. Why? Look at 287-291:
         # https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L287-L291
-        q1 = self.q1(action_hidden_states).squeeze(-1)
-        q2 = self.q2(action_hidden_states).squeeze(-1)
+        #TODO: ?? Why is this "modif[ying] an inplace operation" at runtime?
+        _q1 = self.q1(action_hidden_states.detach())
+        _q2 = self.q2(action_hidden_states.detach())
         # TODO: These should have no_grad() according to 
         #  https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L294
         with torch.no_grad():
-            target_q1 = self.target_q1(action_target_hidden_states).squeeze(-1)
-            target_q2 = self.target_q2(action_target_hidden_states).squeeze(-1)
+            _target_q1 = self.target_q1(action_target_hidden_states.detach())
+            _target_q2 = self.target_q2(action_target_hidden_states.detach())
 
         if not return_dict:
-            outputs = (lm_logits,) + transformer_outputs[1:] + (value,) + (q1,) + (q2,) + (target_q1,) + (target_q2,)
+            outputs = (lm_logits,) + transformer_outputs[1:] + (value,) + (_q1,) + (_q2,) + (_target_q1,) + (_target_q2,)
             return outputs
 
         return CausalLMOutputWithCrossAttentions(
@@ -197,8 +190,8 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
             value=value,
-            qs=(q1, q2),
-            target_qs=(target_q1, target_q2)
+            qs=(_q1, _q2),
+            target_qs=(_target_q2, _target_q2)
         )
     
 
