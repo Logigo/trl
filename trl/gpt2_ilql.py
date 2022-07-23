@@ -55,10 +55,6 @@ class MLPHead(nn.Module):
         self.linear_2 = nn.Linear(self.hidden_dimension*2, output_size)
         # TODO: Whether we use num_tokens() or 1 as an output dimension depends on if it is PerToken (1) or PerUtterance (num_tokens())
     def forward(self, input):
-        x = self.linear_1(input)
-        x = self.non_linearity(x)
-        x = self.linear_2(x)
-        # TODO: Return this to x in case it doesn't solve inplace runtime error
         return self.linear_2(self.non_linearity(self.linear_1(input)))
 
 class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
@@ -160,6 +156,7 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
                 head_mask=head_mask,
                 inputs_embeds=inputs_embeds,
             )
+        # TODO: Maybe this? Doubt it but i am getting DESPERATE 
         target_hidden_states = target_transformer_outputs[0]
         """action_target_hidden_states = torch.gather(input=target_hidden_states, dim=1, index=action_idxs.unsqueeze(2).repeat(1, 1, self.h_dim))"""
         action_target_hidden_states = torch.clone(target_hidden_states)
