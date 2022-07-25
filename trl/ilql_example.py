@@ -106,6 +106,7 @@ for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(dataloader))):
     t = time.time()
     texts = [q + r for q,r in zip(batch['query'], batch['response'])]
     pipe_outputs = sentiment_pipe(texts, **sent_kwargs)
+    # TODO: What if it's this>???
     rewards = torch.tensor([output["score"] if output['label'] == 'POSITIVE' else 1. - output["score"] for output in pipe_outputs]).to(device)
     timing['time/get_sentiment_preds'] = time.time()-t
     

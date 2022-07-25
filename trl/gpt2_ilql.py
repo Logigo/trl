@@ -160,7 +160,6 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
         target_hidden_states = target_transformer_outputs[0]
         """action_target_hidden_states = torch.gather(input=target_hidden_states, dim=1, index=action_idxs.unsqueeze(2).repeat(1, 1, self.h_dim))"""
         action_target_hidden_states = torch.clone(target_hidden_states)
-
         value = self.v_head(state_hidden_states.detach()).squeeze(-1)
         # TODO: I just copied the line above. Most likely incorrect. 
         # Polyak averaged Q Heads
@@ -174,9 +173,10 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
         with torch.no_grad():
             _target_q1 = self.target_q1(action_target_hidden_states.detach())
             _target_q2 = self.target_q2(action_target_hidden_states.detach())
+            _target_q = torch.min(_target_q1, _target_q2)
 
         if not return_dict:
-            outputs = (lm_logits,) + transformer_outputs[1:] + (value,) + (_q1,) + (_q2,) + (_target_q1,) + (_target_q2,)
+            outputs = (lm_logits,) + transformer_outputs[1:] + (value,) + (_q1,) + (_q2,) + (_target_q)
             return outputs
 
         return CausalLMOutputWithCrossAttentions(
@@ -188,7 +188,7 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
             cross_attentions=transformer_outputs.cross_attentions,
             value=value,
             qs=(_q1, _q2),
-            target_qs=(_target_q2, _target_q2)
+            target_qs=(_target_q)
         )
     
 
