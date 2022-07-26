@@ -5,6 +5,6 @@
 		}
 	],
 	"settings": {
-		"pythonPath": "trl/venv"
-	}
+		"pythonPath": "trl/venv",
+	},
 }

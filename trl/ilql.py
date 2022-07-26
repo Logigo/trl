@@ -14,15 +14,9 @@ import random
 from transformers import DataCollatorForLanguageModeling
 from trl.gpt2_ilql import CausalLMOutputWithCrossAttentions, GPT2HeadWithQValueModel
 
-from .core import (logprobs_from_logits,
-                      whiten,
-                      clip_by_value,
-                      entropy_from_logits,
-                      flatten_dict,
-                      average_torch_dicts,
+from .core import (   flatten_dict,
                       stats_to_np,
                       stack_dicts,
-                      add_suffix,
                       WANDB_PADDING)
 
 
@@ -60,7 +54,7 @@ class ILQLTrainer:
     default_params = {
         "lr": 1e-4, # From the paper, A.3
         "batch_size": 256,
-        "forward_batch_size": 16,
+        "forward_batch_size": 256,
         "visual_dialogue_batch_size": 64,
         "reddit_batch_size": 32,
         "ilql_epochs": 4,
@@ -116,39 +110,26 @@ class ILQLTrainer:
         assert bs == len(queries), f"Batch size ({bs}) does not match number of examples ({len(queries)})"
 
         timing = dict()
-        t0 = time.time()
+        t0 = time.time()        
 
-        t = time.time()
-        # Named it _q not q so i can use pdb lol
-        
-        # NOTE: each output is batchwise! Meaning if BS is Y, values would be Y*(1*response_length), and qs would be Y*(1*response_length*vocab_size) (in the per-token case)
-        # logprobs, v, q1, q2, target_q, attn_masks = self.batched_forward_pass(queries, responses)
-        timing['time/ilql/forward_pass'] = time.time()-t
-
-        t = time.time()
-        # TODO: Should this even exist in ILQL? Don't we get rewards from BERT? What does this do?
-        # rewards, non_score_reward = self.compute_rewards(scores, logprobs, ref_logprobs)
-        # TODO: Since ILQL Rewards are just +ve word sentiments (without any KL divergence term), it is kept
-        #  as is.
         rewards = scores.detach()
-        timing['time/ilql/compute_rewards'] = time.time()-t
+        timing['time/ilql/compute_rewards'] = time.time()-t0
 
         t = time.time()
-        all_stats = []
+        all_stats = []      
+        input_ids = self.data_collator([torch.cat([q, r]) for q, r in zip(queries, responses)])["input_ids"]
+        timing['time/ilql/collate_data'] = time.time()-t
+
         idxs = list(range(bs))
         for _ in range(self.ilql_params['ilql_epochs']):
             random.shuffle(idxs)
-            for i in range(bs):
+            # input_ids is of batch_size
+            for i, input_id in enumerate(input_ids):
                 idx = idxs[i]
                 query = queries[idx]
                 response = responses[idx]
                 reward = rewards[idx]
-                print(f'Index:{idx} - BS: {bs}')
-                train_stats = self.train_minibatch_test(query, response, reward)
-                # NOTE: Architectural note, why does train_minibatch get applied to each entry vs. batch? what is a minibatch vs batch
-                # train_stats = self.train_minibatch(logprobs[idx], v[idx],
-                #                                     [q1[idx], q2[idx]], target_q[idx],
-                #                                     rewards[idx], queries[idx], responses[idx])
+                train_stats = self.train_input(query, response, reward, input_id)
                 all_stats.append(train_stats)
         timing['time/ilql/optimize_step'] = time.time()-t
 
@@ -161,53 +142,43 @@ class ILQLTrainer:
 
         t = time.time()
         train_stats = stack_dicts(all_stats)
-
-        # reshape advantages/ratios such that they are not averaged.
-        train_stats['policy/advantages'] = torch.flatten(train_stats['policy/advantages']).unsqueeze(0)
-        train_stats['policy/advantages'] = torch.nan_to_num(train_stats['policy/advantages'], WANDB_PADDING)
-        train_stats['policy/ratio'] = torch.flatten(train_stats['policy/ratio']).unsqueeze(0)
-
         # TODO: Update record_step_stats with the right values
-        # stats = self.record_step_stats(scores=scores, logprobs=logprobs, train_stats=train_stats)
-        # stats = stats_to_np(stats)
+        stats = self.record_step_stats(scores=scores, train_stats=train_stats)
+        stats = stats_to_np(stats)
         timing['time/ilql/calc_stats'] = time.time()-t
         timing['time/ilql/total'] = time.time()-t0
-        # stats.update(timing)
+        stats.update(timing)
         self.step_count += 1
         print(f'Step: {self.step_count}')
         return {}
 
 
-    def train_minibatch_test(self, queries, responses, rewards):
-        input_ids = self.data_collator([torch.cat([queries, responses])])["input_ids"]
-        lmo: CausalLMOutputWithCrossAttentions = self.model(input_ids)
-        logits, attn_masks, v, q1, q2, target_q = lmo.logits, lmo.attentions, lmo.value, lmo.qs[0], lmo.qs[1], lmo.target_qs[0]
-        logprobs = logprobs_from_logits(logits[:, :-1], labels=input_ids[:, 1:])
+    def train_input(self, queries, responses, rewards, input_id):
+        # Compute model output
         train_stats = {}
-        loss, loss_step_stats = self.ilql_loss(logprobs.squeeze(0), v.squeeze(0), [q1.squeeze(0), q2.squeeze(0)], target_q.squeeze(0),
-         rewards, queries, responses)
-        print(f'Loss version: {loss._version}')
-        # TODO: This is just a syntactically correct placeholder I guess
-        train_stats.update(loss_step_stats)
-        # What's the point of having batches if I will propagate gradients with every input?
+        t0 = time.time()
+
+        lmo: CausalLMOutputWithCrossAttentions = self.model(input_id)
+        logits, _, v, q1, q2, target_q = lmo.logits.squeeze(0), lmo.attentions, lmo.value.squeeze(0), lmo.qs[0].squeeze(0), lmo.qs[1].squeeze(0), lmo.target_qs[0].squeeze(0)
+        train_stats['time/ilql/optimize_step/forward_pass'] = time.time()-t0
+        
+        t = time.time()
+        logprobs = logprobs_from_logits(logits, labels=input_id, dim=1)
+        train_stats['time/ilql/optimize_step/logprobs'] = time.time()-t
+
+        # Compute ILQL Loss
+        t = time.time()
+        sequence_len = responses.shape[0]
+        loss, loss_step_stats = self.ilql_loss(v, [q1, q2], target_q, rewards, sequence_len)
+        train_stats['time/ilql/optimize_step/loss'] = time.time()-t
+        # TODO: This is just a syntactically correct placeholder to update stats
+        train_stats['time/ilql/optimize_step/loss'].update(loss_step_stats)
+        # Backward propagate batch
+        t = time.time()
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        return train_stats
-
-
-    # TODO: Arguments need to be changed. 
-    # TODO: Check if rewards is 1 value or not.
-    def train_minibatch(self, logprobs, values, qs, target_qs, rewards, query, response):
-        train_stats = {}
-        loss, loss_step_stats = self.ilql_loss(logprobs, values, qs, target_qs, rewards, query, response)
-        print(f'Loss version: {loss._version}')
-        # TODO: This is just a syntactically correct placeholder I guess
-        train_stats.update(loss_step_stats)
-        # What's the point of having batches if I will propagate gradients with every input?
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        train_stats['time/ilql/optimize_step/backprop'] = time.time()-t
         return train_stats
 
 
@@ -259,27 +230,9 @@ class ILQLTrainer:
 
         pass
 
+
     def L_QV(self, value, next_value, q, q_hat, reward):
-        """
-        When batched_forward_pass requires grad:
-            next_value.requires_grad:       False
-            q.requires_grad :               True
-            q_target.requires_grad:         False
-            L_Q.requires_grad:              True
-            ---
-            value.requires_grad:            True
-            q_hat.requires_grad:            False
-            u.requires_grad:                True
-            fancy_one_symbol.requires_grad: False
-            expectile.requires_grad:        True
-            L_V.requires_grad:              True
-            ---
-            L_Q.mean().requires_grad:       True
-            L_V.mean().requires_grad:       True
-        ---
-        When batched_forward_pass does not require grad:
-            All False
-        """
+        t = time.time()
         def _L_doubleQ(q1, q2, _qt):
             q1_loss = (_qt - q1) ** 2
             q2_loss = (_qt - q2) ** 2
@@ -303,78 +256,36 @@ class ILQLTrainer:
 
         expectation_L_Q = L_Q.mean()
         expectation_L_V = L_V.mean()
-        return expectation_L_Q + expectation_L_V, {}
+        return expectation_L_Q + expectation_L_V, time.time()-t
+
 
     def L_CQL(self, q):
-        """
-        if self.double_q:
-            q1, q2 = qs
-            b, t, d = q1.shape
-            return 
-                (
-                 (F.cross_entropy(q1.reshape(-1, d) / self.cql_temp, action_tokens.reshape(-1), reduction='none').reshape(b, t)
-                 * (1 - terminals[:, :-1])) 
-                 +
-                 (F.cross_entropy(q2.reshape(-1, d) / self.cql_temp, action_tokens.reshape(-1), reduction='none').reshape(b, t)
-                 * (1 - terminals[:, :-1]))
-                 )
-                 .sum() / max(n.item(), 1.0)
-        I am not quite sure what the lines above me mean (https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L366-L369)
-        But I am working on it
-        """
+        t = time.time()
+
         q1, q2 = q[0], q[1]
         numerator1, numerator2 = torch.exp(q1), torch.exp(q2) 
         denominator1, denominator2 = torch.sum(torch.exp(q1)), torch.sum(torch.exp(q2))
         cql1, cql2 = torch.log(torch.divide(numerator1, denominator1)), torch.log(torch.divide(numerator2, denominator2))
         cql = cql1 + cql2
-        # We return CQL in expectation 
-        return cql.mean(), {}
+        # We return CQL in expectation
+        return cql.mean(), time.time()-t
 
-    # TODO: Figure out args from what Charlie says. ILQL has them as (tokens, attn_mask, logits, w). I found out where to get attn_mask from, but I'm not sure if it's coming
-    # from the right transformer (2nd transformer for target_q doesn't exist as of now).
 
-    #  If this is just for PerToken, what are the token arguments in this case?
-    # TODO: https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/utterance_iql_model.py#L201
-    # Utterance ILQL uses AWAC, L_Q, L_V
-    # Token ILQL uses AWAC, L_Q, L_V, L_CQL, DM_Loss (What is DM Loss? :-( ) NOTE: It is unused in the final experiments
-    #  https://github.com/Sea-Snell/Implicit-Language-Q-Learning/blob/13e3d58ee27527a0c819c92702d322a829211540/src/models/iql_model.py#L476
-    def L_AWAC(self):
-        pass
-    
-    def ilql_loss(self, old_logprobs, values, double_qs, double_target_qs, reward, query, response):
-        # TODO: Remove once (if) you solve the bug
-        def _debug(self, l):
-            self.optimizer.zero_grad()
-            l.backward()
-            self.optimizer.step()
-        # TODO : Document this as a loss function that gets applied to a single input at a time, as opposed to a batch
-        sequence_len = response.shape[0]
-        # assert len(values) == len(qs) == len(target_qs) # TODO: Dangerous assertion?
+    def ilql_loss(self, values, double_qs, double_target_qs, reward, sequence_length):
         stats = {}
-        # Why have a list of losses if this function is applied to a sentence at a time? How do we have a different loss scalar for each token in
-        #  the sequence? Do we just sum them?
         total_loss = 0
-        print(f'Sequence length: {sequence_len}')
-        for i in range(sequence_len): 
-            print(f'i: {i}')
-            # SOMEWHERE HERE! V
-            # WHY GOD WHY
-            # Should this have no grads? Why would the next value get a grad?
-            next_value = values[i + 1].detach() if i + 1 < sequence_len else torch.tensor(0., requires_grad=False)
+        print(f'Sequence length: {sequence_length}')
+        for i in range(sequence_length): 
+            next_value = values[i + 1].detach() if i + 1 < sequence_length else torch.tensor(0., requires_grad=False)
             value, double_q, double_target_q = values[i], [double_qs[0][i], double_qs[1][i]], double_target_qs[i]
-            debug_q = [torch.ones(double_q[0].shape), torch.ones(double_q[1].shape)]
-            cql_loss, cql_stats = self.L_CQL(debug_q)
-            print(f'CQL: {cql_loss:}')
-            # _debug(self, l=cql_loss)
-            qv_loss, qv_stats = self.L_QV(value, next_value, double_q, double_target_q, reward)
-            # _debug(self, l=qv_loss)
-            print(f'QV: {qv_loss}')
+            qv_loss, qv_time = self.L_QV(value, next_value, double_q, double_target_q, reward)
+            cql_loss, cql_time = self.L_CQL(double_q)
             loss = qv_loss + (self.ilql_params['alpha'] * cql_loss)
-            # _debug(self, l=loss)
-            print(f'Loss: {loss:}')
             total_loss += loss
-            # _debug(self, l=loss)
-            # TODO: Update stats dicts
+            # Accumulates time spent on qv and cql loss terms in the stats dictionary 
+            stats['qv_time'] = stats.get('qv', 0) + qv_time
+            stats['cql_time'] = stats.get('cql', 0) + cql_time
+        # TODO: What does flatten_dict do haha 
         return total_loss, flatten_dict(stats)
 
     # TODO: Repurpose for ILQL
@@ -399,4 +310,12 @@ class ILQLTrainer:
         stats['ppo/val/var_explained'] = 1 - stats['ppo/val/error'] / stats['ppo/returns/var']
         return stats
 
-
+# NOTE: This replaces the same function from core.py, and specifies a dimension, because I am getting logprobs at the per-input level
+#  since there is no batched forward pass for ILQL like in PPO. 
+def logprobs_from_logits(logits, labels, dim=2):
+    """
+    See: https://github.com/pytorch/pytorch/issues/563#issuecomment-330103591
+    """
+    logp = F.log_softmax(logits, dim=dim)
+    logpy = torch.gather(logp, dim, labels.unsqueeze(dim)).squeeze(-1)
+    return logpy
