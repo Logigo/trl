@@ -10,7 +10,7 @@ import torch
 import collections
 import time
 import random
-
+from typing import List
 from transformers import DataCollatorForLanguageModeling
 from trl.gpt2_ilql import CausalLMOutputWithCrossAttentions, GPT2HeadWithQValueModel
 
@@ -141,40 +141,51 @@ class ILQLTrainer:
             train_stats['time/ilql/target_update'] = time.time()-t
 
         t = time.time()
-        train_stats = stack_dicts(all_stats)
+        stats = self.stack_dicts(all_stats)
         # TODO: Update record_step_stats with the right values
         # stats = self.record_step_stats(scores=scores, train_stats=train_stats)
         # stats = stats_to_np(stats)
         timing['time/ilql/calc_stats'] = time.time()-t
         timing['time/ilql/total'] = time.time()-t0
+        train_stats.update(timing)
         # stats.update(timing)
         self.step_count += 1
         print(f'Step: {self.step_count}')
-        return timing
+        return train_stats
 
+    # TODO: This is my own version of stats_dicts that is not applied to tensor values, but float values 
+    #  Uses recursion for nested dictionaries
+    def stack_dicts(self, stats: List[dict] or dict) -> dict:
+        results = {} # Assumes each dict in the list has the same keys
+        stats_keys = stats[0].keys() if type(stats) == list else stats.keys()
+        # [1, {x y}, 2]
+        for key in stats_keys:
+            list_of_values = [self.stack_dicts(_dict[key]) if type(_dict[key]) == dict else _dict[key] for _dict in stats]
+            results[key] = list_of_values
+        return results 
 
     def train_input(self, queries, responses, rewards, input_id):
         # Compute model output
-        train_stats = {}
+        stats = {}
         t0 = time.time()
 
         lmo: CausalLMOutputWithCrossAttentions = self.model(input_id)
         logits, _, v, q1, q2, target_q = lmo.logits.squeeze(0), lmo.attentions, lmo.value.squeeze(0), lmo.qs[0].squeeze(0), lmo.qs[1].squeeze(0), lmo.target_qs[0].squeeze(0)
-        train_stats['time/ilql/optimize_step/forward_pass'] = time.time()-t0
+        stats['forward_pass'] = time.time()-t0
     
         # Compute ILQL Loss
         t = time.time()
         sequence_len = responses.shape[0]
         loss, loss_step_stats = self.ilql_loss(v, [q1, q2], target_q, rewards, sequence_len)
         # TODO: This is just a syntactically correct placeholder to update stats
-        train_stats['time/ilql/optimize_step/loss'] = {'total_time': time.time()-t, **loss_step_stats}
+        stats['loss'] = {'total_time': time.time()-t, **loss_step_stats}
         # Backward propagate batch
         t = time.time()
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        train_stats['time/ilql/optimize_step/backprop'] = time.time()-t
-        return train_stats
+        stats['backprop'] = time.time()-t
+        return flatten_dict(stats)
 
 
     def batched_forward_pass(self, queries, responses):
@@ -274,7 +285,7 @@ class ILQLTrainer:
         total_v_loss = 0.
         total_qv_time = 0.
         total_cql_time = 0.
-        print(f'Sequence length: {sequence_length}')
+
         # TODO: Might need something other than stack_dicts for a loss function like this - check ppo.py vs this to see
         for i in range(sequence_length): 
             next_value = values[i + 1].detach() if i + 1 < sequence_length else torch.tensor(0., requires_grad=False)
@@ -294,7 +305,7 @@ class ILQLTrainer:
             loss=dict(total=total_loss, q_loss=total_qv_loss-total_v_loss, v_loss=total_v_loss, 
             qv_loss=total_qv_loss, cql_loss=total_cql_loss),
         )
-        return total_loss, flatten_dict(stats)
+        return total_loss, stats
 
     # TODO: Repurpose for ILQL
     def record_step_stats(self, kl_coef, **data):

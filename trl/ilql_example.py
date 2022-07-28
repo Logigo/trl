@@ -90,12 +90,9 @@ for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(dataloader))):
     #### Get response from gpt2
     t = time.time()
     response_tensors = []
-    # TODO: Why does this for loop exist? Don't we generate responses in step?
     for i in range(ilql_config['batch_size']):
         gen_len = output_size()
-        # NOTE: This is what caused the problem. This should have no grad as it is only generating the rewards.
-        #  This should also not be the reference transformer pi_beta, as pi_beta is not being trained. Or should it be pi_beta?
-        with torch.no_grad():
+                with torch.no_grad():
             response = gpt2_model.generate(query_tensors[i].unsqueeze(dim=0),
                                         max_new_tokens=gen_len, **gen_kwargs)
         response_tensors.append(response.squeeze()[-gen_len:])
@@ -106,7 +103,6 @@ for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(dataloader))):
     t = time.time()
     texts = [q + r for q,r in zip(batch['query'], batch['response'])]
     pipe_outputs = sentiment_pipe(texts, **sent_kwargs)
-    # TODO: What if it's this>???
     rewards = torch.tensor([output["score"] if output['label'] == 'POSITIVE' else 1. - output["score"] for output in pipe_outputs]).to(device)
     timing['time/get_sentiment_preds'] = time.time()-t
     
