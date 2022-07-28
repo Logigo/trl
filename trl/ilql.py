@@ -143,14 +143,14 @@ class ILQLTrainer:
         t = time.time()
         train_stats = stack_dicts(all_stats)
         # TODO: Update record_step_stats with the right values
-        stats = self.record_step_stats(scores=scores, train_stats=train_stats)
-        stats = stats_to_np(stats)
+        # stats = self.record_step_stats(scores=scores, train_stats=train_stats)
+        # stats = stats_to_np(stats)
         timing['time/ilql/calc_stats'] = time.time()-t
         timing['time/ilql/total'] = time.time()-t0
-        stats.update(timing)
+        # stats.update(timing)
         self.step_count += 1
         print(f'Step: {self.step_count}')
-        return {}
+        return timing
 
 
     def train_input(self, queries, responses, rewards, input_id):
@@ -161,18 +161,13 @@ class ILQLTrainer:
         lmo: CausalLMOutputWithCrossAttentions = self.model(input_id)
         logits, _, v, q1, q2, target_q = lmo.logits.squeeze(0), lmo.attentions, lmo.value.squeeze(0), lmo.qs[0].squeeze(0), lmo.qs[1].squeeze(0), lmo.target_qs[0].squeeze(0)
         train_stats['time/ilql/optimize_step/forward_pass'] = time.time()-t0
-        
-        t = time.time()
-        logprobs = logprobs_from_logits(logits, labels=input_id, dim=1)
-        train_stats['time/ilql/optimize_step/logprobs'] = time.time()-t
-
+    
         # Compute ILQL Loss
         t = time.time()
         sequence_len = responses.shape[0]
         loss, loss_step_stats = self.ilql_loss(v, [q1, q2], target_q, rewards, sequence_len)
-        train_stats['time/ilql/optimize_step/loss'] = time.time()-t
         # TODO: This is just a syntactically correct placeholder to update stats
-        train_stats['time/ilql/optimize_step/loss'].update(loss_step_stats)
+        train_stats['time/ilql/optimize_step/loss'] = {'total_time': time.time()-t, **loss_step_stats}
         # Backward propagate batch
         t = time.time()
         self.optimizer.zero_grad()
@@ -256,12 +251,12 @@ class ILQLTrainer:
 
         expectation_L_Q = L_Q.mean()
         expectation_L_V = L_V.mean()
-        return expectation_L_Q + expectation_L_V, time.time()-t
+        # TODO: Should I record E[L_Q] and E[L_V] here? NOTE: I return E[L_V] so I can record both E[L_V] and E[Q_V] in ilql_loss
+        return expectation_L_Q + expectation_L_V, expectation_L_V, time.time()-t
 
 
     def L_CQL(self, q):
         t = time.time()
-
         q1, q2 = q[0], q[1]
         numerator1, numerator2 = torch.exp(q1), torch.exp(q2) 
         denominator1, denominator2 = torch.sum(torch.exp(q1)), torch.sum(torch.exp(q2))
@@ -272,20 +267,33 @@ class ILQLTrainer:
 
 
     def ilql_loss(self, values, double_qs, double_target_qs, reward, sequence_length):
+        # TODO: Rework this to work with stack_dicts - key difference with this loss and ppo is that this is applied to multiple words
         stats = {}
-        total_loss = 0
+        total_qv_loss = 0.
+        total_cql_loss = 0.
+        total_v_loss = 0.
+        total_qv_time = 0.
+        total_cql_time = 0.
         print(f'Sequence length: {sequence_length}')
+        # TODO: Might need something other than stack_dicts for a loss function like this - check ppo.py vs this to see
         for i in range(sequence_length): 
             next_value = values[i + 1].detach() if i + 1 < sequence_length else torch.tensor(0., requires_grad=False)
             value, double_q, double_target_q = values[i], [double_qs[0][i], double_qs[1][i]], double_target_qs[i]
-            qv_loss, qv_time = self.L_QV(value, next_value, double_q, double_target_q, reward)
+            qv_loss, v_loss, qv_time = self.L_QV(value, next_value, double_q, double_target_q, reward)
             cql_loss, cql_time = self.L_CQL(double_q)
-            loss = qv_loss + (self.ilql_params['alpha'] * cql_loss)
-            total_loss += loss
+            # Update totals for more granular logging
+            total_qv_loss += qv_loss
+            total_cql_loss += cql_loss
+            total_v_loss += v_loss
+            total_qv_time += qv_time
+            total_cql_time += cql_time
             # Accumulates time spent on qv and cql loss terms in the stats dictionary 
-            stats['qv_time'] = stats.get('qv', 0) + qv_time
-            stats['cql_time'] = stats.get('cql', 0) + cql_time
         # TODO: What does flatten_dict do haha 
+        total_loss = total_qv_loss + (self.ilql_params['alpha'] * cql_loss)
+        stats = dict(
+            loss=dict(total=total_loss, q_loss=total_qv_loss-total_v_loss, v_loss=total_v_loss, 
+            qv_loss=total_qv_loss, cql_loss=total_cql_loss),
+        )
         return total_loss, flatten_dict(stats)
 
     # TODO: Repurpose for ILQL
@@ -297,7 +305,7 @@ class ILQLTrainer:
         mean_non_score_reward =torch.mean(torch.stack([torch.sum(non_score_reward) for non_score_reward in data['non_score_reward']]))
         stats = {
             'objective/kl': mean_kl,
-            'objective/kl_dist': kl_list,
+            'objective/kl_dist': kl_list, 
             'objective/logprobs': data['logprobs'],
             'objective/ref_logprobs': data['ref_logprobs'],
             'objective/kl_coef': kl_coef,
