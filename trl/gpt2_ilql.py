@@ -176,7 +176,7 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
             _target_q = torch.min(_target_q1, _target_q2)
 
         if not return_dict:
-            outputs = (lm_logits,) + transformer_outputs[1:] + (value,) + (_q1,) + (_q2,) + (_target_q)
+            outputs = (lm_logits,) + (transformer_outputs[1:],) + (value,) + (_q1,) + (_q2,) + (_target_q,)
             return outputs
 
         return CausalLMOutputWithCrossAttentions(
@@ -193,17 +193,19 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
     
 
 # Cell
-
-def respond_to_batch(model, queries, txt_len=20, top_k=0, top_p=1.0):
+# TODO: This is the inference?
+def respond_to_batch(pi_beta_model, ilql_model, queries, txt_len=20, beta=8):
     """Sample text from language model."""
     input_ids = queries
     for i in range(txt_len):
         # Get Logits
-        outputs = model(input_ids)
-        next_token_logits = outputs[0][:, -1, :]
-        next_token_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
+        pi_beta_logits = pi_beta_model(input_ids)
+        logits, _, v, q1, q2, _ = ilql_model(input_ids, return_dict=False)
+        q = torch.minimum(q1, q2)
+        next_token_q, next_token_v = q[-1, :], v[-1]
+        next_token_logits = pi_beta_logits[0][-1, :] + (beta * (next_token_q - next_token_v))
         # Sample
         probs = F.softmax(next_token_logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
-        input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
-    return input_ids[:, -txt_len:]
+        next_token = torch.multinomial(probs, num_samples=1)
+        input_ids = torch.cat([input_ids, next_token], dim=-1)
+    return input_ids[-txt_len:]

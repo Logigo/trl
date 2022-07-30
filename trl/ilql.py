@@ -148,9 +148,10 @@ class ILQLTrainer:
         timing['time/ilql/calc_stats'] = time.time()-t
         timing['time/ilql/total'] = time.time()-t0
         train_stats.update(timing)
-        # stats.update(timing)
+        stats.update(train_stats)
         self.step_count += 1
         print(f'Step: {self.step_count}')
+
         return train_stats
 
     # TODO: This is my own version of stats_dicts that is not applied to tensor values, but float values 
@@ -308,25 +309,12 @@ class ILQLTrainer:
         return total_loss, stats
 
     # TODO: Repurpose for ILQL
-    def record_step_stats(self, kl_coef, **data):
+    def record_step_stats(self, **data):
         """Record training step statistics."""
-        kl_list = [logprobs-ref_logprobs for logprobs, ref_logprobs in zip(data['logprobs'], data['ref_logprobs'])]
-        mean_kl = torch.mean(torch.stack([torch.sum(kl) for kl in kl_list]))
-        mean_entropy = torch.mean(torch.stack([torch.sum(-log_probs) for log_probs in data['logprobs']]))
-        mean_non_score_reward =torch.mean(torch.stack([torch.sum(non_score_reward) for non_score_reward in data['non_score_reward']]))
-        stats = {
-            'objective/kl': mean_kl,
-            'objective/kl_dist': kl_list, 
-            'objective/logprobs': data['logprobs'],
-            'objective/ref_logprobs': data['ref_logprobs'],
-            'objective/kl_coef': kl_coef,
-            'objective/entropy': mean_entropy,
-            'ppo/mean_non_score_reward': mean_non_score_reward,
-        }
-
+        stats = {}
         for k, v in data['train_stats'].items():
-            stats[f'ppo/{k}'] = torch.mean(v, axis=0)
-        stats['ppo/val/var_explained'] = 1 - stats['ppo/val/error'] / stats['ppo/returns/var']
+            stats[f'ilql/{k}'] = torch.mean(v, axis=0)
+            
         return stats
 
 # NOTE: This replaces the same function from core.py, and specifies a dimension, because I am getting logprobs at the per-input level

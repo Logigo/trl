@@ -13,19 +13,15 @@ from tqdm import tqdm
 
 # NOTE: Straight up copied from https://github.com/lvwerra/trl/blob/master/nbs/04-gpt2-sentiment-ppo-training.ipynb
 ilql_config = {
-    'steps': 2, 'batch_size': 6, 'forward_batch_size': 3, 'model_name': 'lvwerra/gpt2-imdb', 
+    'steps': 3, 'batch_size': 3, 'forward_batch_size': 1, 'model_name': 'lvwerra/gpt2-imdb', 
     "txt_in_min_len": 2, "txt_in_max_len": 8, "txt_out_min_len": 4, "txt_out_max_len": 16
 }
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 pipe_device = 0 if torch.cuda.is_available() else -1
 
-wandb.init(name='run-2', project='ilql-gpt2-test', config=ilql_config, )
+wandb.init(name='training_run1', project='ilql-gpt2', config=ilql_config, )
 
-# load imdb with datasets
-ds = load_dataset('imdb', split='train')
-ds = ds.rename_columns({'text': 'review', 'label': 'sentiment'})
-ds = ds.filter(lambda x: len(x["review"])>200, batched=False)
 
 # get model response
 sent_kwargs = {
@@ -38,14 +34,14 @@ sentiment_pipe = pipeline("sentiment-analysis","lvwerra/distilbert-imdb", device
 # get models
 
 # TODO: Find a way to pass PerUtterance OR PerToken to GPT2 Model
-gpt2_model = GPT2HeadWithQValueModel.from_pretrained('gpt2')
+ilql_model = GPT2HeadWithQValueModel.from_pretrained('gpt2')
 gpt2_pi_beta = GPT2HeadWithQValueModel.from_pretrained('gpt2')
 
 gpt2_tokenizer = AutoTokenizer.from_pretrained(ilql_config['model_name'])
 gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
 
-wandb.watch(gpt2_model, log='all')
-gpt2_model.to(device)
+wandb.watch(ilql_model, log='all')
+ilql_model.to(device)
 gpt2_pi_beta.to(device)
 
 class LengthSampler:
@@ -62,7 +58,18 @@ def tokenize(sample):
     sample["query"] = gpt2_tokenizer.decode(sample["tokens"])
     return sample
 
-ds = ds.map(tokenize, batched=False)
+# load imdb with datasets
+ds_train, ds_test = load_dataset('imdb', split=['train[:8%]', 'test[-2%:]'])
+
+
+def process_data(dataset):
+    dataset = dataset.rename_columns({'text': 'review', 'label': 'sentiment'})
+    dataset = dataset.filter(lambda x: len(x["review"])>200, batched=False)
+    dataset = dataset.map(tokenize, batched=False)
+    return dataset
+
+ds_train = process_data(ds_train)
+ds_test = process_data(ds_test)
 
 gen_kwargs = {
     "min_length":-1,
@@ -75,15 +82,16 @@ gen_kwargs = {
 def collater(data):
     return dict((key, [d[key] for d in data]) for key in data[0])
 
-dataloader = torch.utils.data.DataLoader(ds, batch_size=ilql_config['batch_size'], collate_fn=collater)
+dataloader_train = torch.utils.data.DataLoader(ds_train, batch_size=ilql_config['batch_size'], collate_fn=collater)
+dataloader_test = torch.utils.data.DataLoader(ds_test, batch_size=ilql_config['batch_size'], collate_fn=collater)
 # Training loop
 
 # initialize trainer
-ilql_trainer = ILQLTrainer(gpt2_model, gpt2_tokenizer, **ilql_config)
+ilql_trainer = ILQLTrainer(ilql_model, gpt2_tokenizer, **ilql_config)
 
 total_ilql_epochs = int(np.ceil(ilql_config["steps"]/ilql_config['batch_size']))
 
-for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(dataloader))):
+for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(dataloader_train))):
     logs, timing = dict(), dict()
     t0 = time.time()
     query_tensors = [torch.tensor(t).long().to(device) for t in batch["tokens"]]
@@ -92,11 +100,11 @@ for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(dataloader))):
     response_tensors = []
     for i in range(ilql_config['batch_size']):
         gen_len = output_size()
-                with torch.no_grad():
-            response = gpt2_model.generate(query_tensors[i].unsqueeze(dim=0),
+        with torch.no_grad():
+            response = ilql_model.generate(query_tensors[i].unsqueeze(dim=0),
                                         max_new_tokens=gen_len, **gen_kwargs)
         response_tensors.append(response.squeeze()[-gen_len:])
-    batch['response'] = [gpt2_tokenizer.decode(r.squeeze()) for r in response_tensors] # This takes so long, why? 
+    batch['response'] = [gpt2_tokenizer.decode(r.squeeze()) for r in response_tensors]
     timing['time/get_response'] = time.time()-t
 
     #### Compute sentiment score
@@ -110,7 +118,8 @@ for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(dataloader))):
     t = time.time()
     stats = ilql_trainer.step(query_tensors, response_tensors, rewards)
     timing['time/optimization'] = time.time()-t
-     
+    # TODO This is only here so I can test that the function can run 
+    respond_to_batch(pi_beta_model=gpt2_pi_beta, ilql_model=ilql_model, queries=query_tensors[0], txt_len=ilql_config['txt_out_max_len'], beta=8)
     #### Log everything
     timing['time/epoch'] = time.time()-t0
     table_rows = [list(r) for r in zip(batch['query'], batch['response'], rewards.cpu().tolist())]
@@ -121,3 +130,6 @@ for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(dataloader))):
     logs['env/reward_std'] = torch.std(rewards).cpu().numpy()
     logs['env/reward_dist'] = rewards.cpu().numpy()
     wandb.log(logs)
+
+# Evaluating performance on test dataset - Run inference with ILQL model, and pass the results through bert to see 
+#  +ivity rate. 
