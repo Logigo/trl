@@ -156,7 +156,7 @@ for epoch, batch in tqdm(zip(range(total_ilql_epochs), iter(dataloader_train))):
                 'rewards': v_batch_rewards
             })
         # Log results
-        v_rewards = [] ; [rewards.extend(v['rewards']) for v in validation_stats]
+        v_rewards = [] ; [v_rewards.extend(v['rewards']) for v in validation_stats]
         logs['validation_rewards_mean'] = torch.mean(v_rewards).cpu().numpy()
         logs['validation_rewards_std'] = torch.std(v_rewards).cpu().numpy()
         logs['validation_rewards'] = v_rewards # TODO. Graph pareto frontier?  x - nll for generation. y - beta
