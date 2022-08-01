@@ -193,14 +193,15 @@ class GPT2HeadWithQValueModel(GPT2PreTrainedModel):
     
 
 # Cell
-# TODO: This is the inference?
-def respond_to_batch(pi_beta_model, ilql_model, queries, txt_len=20, beta=8):
+# TODO: Does this respond to a batch? Or just a single input? Uh oh!
+def respond_to_batch(pi_beta_model, ilql_model, txt_len, beta, queries):
     """Sample text from language model."""
     input_ids = queries
     for i in range(txt_len):
         # Get Logits
-        pi_beta_logits = pi_beta_model(input_ids)
-        logits, _, v, q1, q2, _ = ilql_model(input_ids, return_dict=False)
+        with torch.no_grad:
+            pi_beta_logits = pi_beta_model(input_ids)
+            logits, _, v, q1, q2, _ = ilql_model(input_ids, return_dict=False)
         q = torch.minimum(q1, q2)
         next_token_q, next_token_v = q[-1, :], v[-1]
         next_token_logits = pi_beta_logits[0][-1, :] + (beta * (next_token_q - next_token_v))
